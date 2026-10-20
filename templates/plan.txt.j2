@@ -1,0 +1,98 @@
+{#
+  Output of `deploy-talos.py plan` (print_plan).
+  Variables:
+    cfg            the validated cluster file (Config: cfg.lan, cfg.argocd, cfg.oidc may be None)
+    api_endpoint   address of the Kubernetes API
+    pool           (first, last) address of the LoadBalancer pool, LAN mode only
+    nodes          the planned nodes (name, role, ip, lan_ip)
+  cfg.cert_manager, cfg.headlamp and cfg.longhorn are None when their sections are absent.
+  Filter `columns` aligns a list of rows into a text table.
+#}
+{% set cp, w = cfg.control_planes, cfg.workers %}
+{# Storage nodes (longhorn section): sized like a group, plus a data disk each. #}
+{% set st = cfg.longhorn.nodes if cfg.longhorn else none %}
+{% set st_count, st_vcpus, st_memory = (st.count, st.vcpus, st.memory) if st else (0, 0, 0) %}
+Cluster:        {{ cfg.name }}  (from {{ cfg.source }})
+Talos:          {{ cfg.talos_version }}, Kubernetes {{ cfg.kubernetes_version or 'default for this release' }}
+Extensions:     {{ cfg.extensions | join(', ') or 'none' }}
+{% if cfg.existing_bridge %}
+Network:        existing bridge {{ cfg.existing_bridge }}, {{ cfg.net_prefix }}.0/24 static, gateway {{ cfg.net_gateway or 'none' }}, DNS {{ cfg.nameservers | join(', ') or 'Talos defaults' }}
+{% else %}
+Network:        libvirt NAT network {{ cfg.network }} on bridge {{ cfg.net_bridge_name or '(auto)' }}, {{ cfg.net_prefix }}.0/24
+{% endif %}
+API endpoint:   https://{{ api_endpoint }}:6443
+{% if cfg.lan %}
+LAN:            bridge {{ cfg.lan.bridge }}, gateway {{ cfg.lan.gateway or 'auto' }}, prefix length {{ cfg.lan.prefix_length or 'auto' }}, node addresses {{ 'by DHCP (names registered by the DHCP server)' if cfg.lan.dhcp else 'from the range' }}
+CNI:            Cilium {{ cfg.cilium_version }} (Gateway API {{ cfg.gateway_api_version }}), LoadBalancer pool {{ pool[0] }}-{{ pool[1] }}
+{% else %}
+LAN:            disabled
+CNI:            flannel (Talos default)
+{% endif %}
+Resources:      {{ cp.count * cp.vcpus + w.count * w.vcpus + st_count * st_vcpus }} vCPU, {{ cp.count * cp.memory + w.count * w.memory + st_count * st_memory }} MiB RAM, {{ cp.count }} x {{ cp.disk_size }} + {{ w.count }} x {{ w.disk_size }}{{ (' + ' ~ st_count ~ ' x (' ~ st.disk_size ~ ' + ' ~ cfg.longhorn.data_disk_size ~ ')') if st else '' }} disk (thin)
+{% if cfg.argocd %}
+{% set a, r = cfg.argocd, cfg.argocd.repo %}
+Argo CD:        chart {{ a.chart_version }}, UI {{ ('at https://' ~ a.hostname ~ (' (HTTPRoute, TLS terminated on the ingress gateway)' if cfg.cert_manager else ' (TLSRoute on the ingress gateway)')) if a.hostname else 'by port-forward only' }}
+  repository:   {{ r.url }} @ {{ r.revision }}, path {{ r.path }}{{ ' (recursive)' if r.recurse else '' }}
+  auth:         {{ r.method }}{{ (', known hosts ' ~ r.known_hosts) if r.method == 'ssh' else '' }}
+  application:  {{ a.app_name }} -> namespace {{ a.app_namespace }}, prune {{ a.prune | string | lower }}, selfHeal {{ a.self_heal | string | lower }}
+  add-ons:      {{ ('from Git: ' ~ a.addons.path ~ ' (pushed with ' ~ (a.addons.push_ssh_key_file or a.addons.push_token_file) ~ '; content: ' ~ a.addons.content ~ ')') if a.addons else 'installed with Helm' }}
+{% if a.addons and a.addons.sops_key_file %}
+  secrets:      in Git, SOPS-encrypted for {{ a.addons.sops_key_file }}{{ (' + ' ~ (a.addons.sops_recipients | length) ~ ' more recipient(s)') if a.addons.sops_recipients else '' }} (KSOPS)
+{% endif %}
+{% else %}
+Argo CD:        disabled
+{% endif %}
+{% if cfg.oidc %}
+{% set o = cfg.oidc %}
+OIDC:           {{ o.issuer }} ({{ 'realm/clients managed by the script' if o.managed else 'pre-configured clients' }})
+  kubernetes:   client {{ o.k8s_client_id }}, cluster-admin for group(s) {{ o.k8s_admin_groups | join(', ') }} (prefix '{{ o.groups_prefix }}')
+{% if cfg.argocd %}
+  argocd:       client {{ o.argocd_client_id }}, admin for group(s) {{ o.argocd_admin_groups | join(', ') }}
+{% endif %}
+{% else %}
+OIDC:           disabled
+{% endif %}
+{% if cfg.cert_manager %}
+{% set cm = cfg.cert_manager %}
+Certificates:   cert-manager chart {{ cm.chart_version }}, ACME {{ cm.acme_server }}{{ (' (CA ' ~ cm.ca_file ~ ')') if cm.ca_file else '' }}{{ ('\n  extra hosts:  ' ~ cm.extra_hosts | join(', ')) if cm.extra_hosts else '' }}
+{% else %}
+Certificates:   disabled (no HTTPS listener on the gateway)
+{% endif %}
+{% if cfg.headlamp %}
+{% set h = cfg.headlamp %}
+Headlamp:       chart {{ h.chart_version }}, UI {{ ('at https://' ~ h.hostname) if h.hostname else 'by port-forward only' }}, login {{ ('through Keycloak (client ' ~ cfg.oidc.headlamp_client_id ~ ')') if cfg.oidc else 'with a token' }}
+{% else %}
+Headlamp:       disabled
+{% endif %}
+{% if cfg.longhorn %}
+{% set lh = cfg.longhorn %}
+Longhorn:       chart {{ lh.chart_version }}, {{ st_count }} storage node(s) (internal network only, data disk {{ lh.data_disk_size }}), {{ lh.replicas }} replica(s), StorageClass longhorn{{ ' (default)' if lh.default_class else '' }}
+{% else %}
+Longhorn:       disabled
+{% endif %}
+Metrics:        {{ ('metrics-server chart ' ~ cfg.metrics_server.chart_version ~ ' (kubectl top)') if cfg.metrics_server else 'none' }}
+{% if cfg.monitoring %}
+{% set m = cfg.monitoring %}
+Monitoring:     kube-prometheus-stack chart {{ m.chart_version }}, Prometheus {{ m.retention }}{{ (' on a ' ~ m.storage_size ~ ' Longhorn volume') if cfg.longhorn else ' (no volume: data lost on restart)' }}, Grafana {{ ('at https://' ~ m.hostname) if m.hostname else 'by port-forward only' }}{{ (', login through Keycloak (client ' ~ cfg.oidc.grafana_client_id ~ ', admins ' ~ cfg.oidc.grafana_admin_groups | join(', ') ~ ')') if cfg.oidc else '' }}
+{% else %}
+Monitoring:     none
+{% endif %}
+Upgrades:       {{ ('tuppr chart ' ~ cfg.tuppr.chart_version ~ ' (TalosUpgrade/KubernetesUpgrade in Git)') if cfg.tuppr else 'by this script (upgrade, upgrade-k8s)' }}
+Backups:        {{ ('etcd to ' ~ cfg.talos_backup.endpoint ~ '/' ~ cfg.talos_backup.bucket ~ '/' ~ cfg.name ~ '/, ' ~ cfg.talos_backup.schedule ~ ' (age-encrypted)') if cfg.talos_backup else 'none' }}
+Images:         {{ ('through ' ~ cfg.registry.mirror ~ ' (' ~ cfg.registry.registries | join(', ') ~ ')') if cfg.registry else 'pulled directly from their registries' }}
+{% if cfg.omni %}Omni:           {{ cfg.omni.endpoint }} (import: deploy-talos.py omni; omnictl {{ cfg.omni.omnictl_version }}{{ ', nodes trust ' ~ cfg.omni.ca_file if cfg.omni.ca_file else '' }})
+{% endif %}
+Cluster dir:    {{ cfg.cluster_dir }}
+Secrets dir:    {{ cfg.secrets_dir or '(none: relative credential paths are next to the file)' }}
+Cache dir:      {{ cfg.cache_dir }}
+
+{# One row per node, sized like its group. #}
+{% set table = namespace(rows=[["NODE", "ROLE", "INTERNAL IP", "LAN IP", "vCPU", "MEMORY", "DISK"]]) %}
+{% for n in nodes %}
+{% set g = cp if n.role == 'controlplane' else (st if n.role == 'storage' else w) %}
+{% set disk = (g.disk_size ~ ' + ' ~ cfg.longhorn.data_disk_size) if n.role == 'storage' else g.disk_size %}
+{% set table.rows = table.rows + [[n.name, n.role, n.ip, n.lan_ip or ('DHCP' if n.lan_mac else '-'), g.vcpus | string, g.memory ~ ' MiB', disk]] %}
+{% endfor %}
+{% for line in table.rows | columns %}
+{{ line }}
+{% endfor %}

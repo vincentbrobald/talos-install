@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="680" viewBox="0 0 900 680" role="img" aria-labelledby="t d" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13">
+<title id="t">Talos: private network topology</title>
+<desc id="d">Nodes on a libvirt NAT network created for the cluster; only the host reaches them.</desc>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7b8794"/></marker></defs>
+<rect width="900" height="680" fill="#ffffff"/>
+<text x="20" y="32.0" text-anchor="start" font-size="18" fill="#1f2933" font-weight="600">Talos — private network (default)</text>
+<text x="20" y="52.0" text-anchor="start" font-size="12" fill="#52606d">Only this host reaches the cluster. Addresses for network.prefix 10.44.0 (the default).</text>
+<rect x="600" y="14" width="280" height="50" rx="8" fill="#eef0f2" stroke="#7b8794" stroke-width="1.5"/>
+<text x="740.0" y="35.0" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">Internet</text>
+<text x="740.0" y="52.0" text-anchor="middle" font-size="12" fill="#52606d">Image Factory, GitHub, registries</text>
+<rect x="20" y="80" width="860" height="560" rx="8" fill="#f5f7fa" stroke="#9aa5b1" stroke-width="1.5"/>
+<text x="32" y="100.0" text-anchor="start" font-size="13" fill="#9aa5b1" font-weight="600">KVM host (libvirt, qemu:///system)</text>
+<rect x="40" y="112" width="320" height="70" rx="8" fill="#ffffff" stroke="#52606d" stroke-width="1.5"/>
+<text x="200.0" y="143.1" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">deploy-talos.py, kubectl, talosctl</text>
+<text x="200.0" y="160.1" text-anchor="middle" font-size="12" fill="#52606d">&lt;name&gt;-cluster/: kubeconfig, talosconfig</text>
+<rect x="40" y="250" width="820" height="370" rx="8" fill="#e8f1fb" stroke="#4a7fc1" stroke-width="1.5"/>
+<text x="52" y="270.0" text-anchor="start" font-size="13" fill="#4a7fc1" font-weight="600">libvirt NAT network talos-&lt;name&gt;  ·  10.44.0.0/24</text>
+<rect x="600" y="280" width="240" height="62" rx="8" fill="#e8f1fb" stroke="#4a7fc1" stroke-width="1.5"/>
+<text x="720.0" y="307.1" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">.1  virbrN on the host</text>
+<text x="720.0" y="324.1" text-anchor="middle" font-size="12" fill="#52606d">gateway (NAT), DHCP, DNS</text>
+<path d="M720,280 L720,64" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="704.9" y="87" width="30.2" height="19" rx="3" fill="#ffffff" fill-opacity="0.92"/>
+<text x="720" y="101.0" text-anchor="middle" font-size="12" fill="#52606d">NAT</text>
+<rect x="330" y="280" width="240" height="62" rx="8" fill="#f1e8fb" stroke="#7a4fb5" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="450.0" y="307.1" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">.10  API VIP :6443</text>
+<text x="450.0" y="324.1" text-anchor="middle" font-size="12" fill="#52606d">3+ control planes; else cp-1</text>
+<path d="M340,182 L450,280" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="366.5" y="209" width="57.0" height="19" rx="3" fill="#ffffff" fill-opacity="0.92"/>
+<text x="395" y="223.0" text-anchor="middle" font-size="12" fill="#52606d">kubectl</text>
+<path d="M110,182 L110,250" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)"/>
+<rect x="17.6" y="209" width="184.7" height="19" rx="3" fill="#ffffff" fill-opacity="0.92"/>
+<text x="110" y="223.0" text-anchor="middle" font-size="12" fill="#52606d">talosctl :50000, all nodes</text>
+<rect x="60" y="380" width="240" height="84" rx="8" fill="#fde8e1" stroke="#c4572e" stroke-width="1.5"/>
+<text x="180.0" y="409.6" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">cp-1   .11</text>
+<text x="180.0" y="426.6" text-anchor="middle" font-size="12" fill="#52606d">etcd, API server, scheduler</text>
+<text x="180.0" y="443.6" text-anchor="middle" font-size="12" fill="#52606d">Talos API :50000</text>
+<path d="M450,342 L180,380" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="5 4"/>
+<rect x="330" y="380" width="240" height="84" rx="8" fill="#fde8e1" stroke="#c4572e" stroke-width="1.5"/>
+<text x="450.0" y="409.6" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">cp-2   .12</text>
+<text x="450.0" y="426.6" text-anchor="middle" font-size="12" fill="#52606d">etcd, API server, scheduler</text>
+<text x="450.0" y="443.6" text-anchor="middle" font-size="12" fill="#52606d">Talos API :50000</text>
+<path d="M450,342 L450,380" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="5 4"/>
+<rect x="600" y="380" width="240" height="84" rx="8" fill="#fde8e1" stroke="#c4572e" stroke-width="1.5"/>
+<text x="720.0" y="409.6" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">cp-3   .13</text>
+<text x="720.0" y="426.6" text-anchor="middle" font-size="12" fill="#52606d">etcd, API server, scheduler</text>
+<text x="720.0" y="443.6" text-anchor="middle" font-size="12" fill="#52606d">Talos API :50000</text>
+<path d="M450,342 L720,380" fill="none" stroke="#7b8794" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="5 4"/>
+<rect x="60" y="500" width="240" height="84" rx="8" fill="#e3f4e8" stroke="#2f8a4c" stroke-width="1.5"/>
+<text x="180.0" y="529.5" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">w-1   .21</text>
+<text x="180.0" y="546.5" text-anchor="middle" font-size="12" fill="#52606d">kubelet, workloads</text>
+<text x="180.0" y="563.5" text-anchor="middle" font-size="12" fill="#52606d">pod network: flannel</text>
+<rect x="330" y="500" width="240" height="84" rx="8" fill="#e3f4e8" stroke="#2f8a4c" stroke-width="1.5"/>
+<text x="450.0" y="529.5" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">w-2   .22</text>
+<text x="450.0" y="546.5" text-anchor="middle" font-size="12" fill="#52606d">kubelet, workloads</text>
+<text x="450.0" y="563.5" text-anchor="middle" font-size="12" fill="#52606d">pod network: flannel</text>
+<rect x="600" y="500" width="240" height="84" rx="8" fill="#e3f4e8" stroke="#2f8a4c" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="720.0" y="529.5" text-anchor="middle" font-size="13" fill="#1f2933" font-weight="600">w-3 … w-79</text>
+<text x="720.0" y="546.5" text-anchor="middle" font-size="12" fill="#52606d">.23 – .99</text>
+<text x="720.0" y="563.5" text-anchor="middle" font-size="12" fill="#52606d">added by scale</text>
+<text x="450" y="612.0" text-anchor="middle" font-size="12" fill="#52606d">.100–.199: DHCP pool, unused by the cluster  ·  existingBridge: same layout, static addresses, your router on .1</text>
+<rect x="40" y="655" width="16" height="12" rx="3" fill="#fde8e1" stroke="#c4572e" stroke-width="1.3"/>
+<text x="62" y="666.0" text-anchor="start" font-size="12" fill="#52606d">control plane</text>
+<rect x="190" y="655" width="16" height="12" rx="3" fill="#e3f4e8" stroke="#2f8a4c" stroke-width="1.3"/>
+<text x="212" y="666.0" text-anchor="start" font-size="12" fill="#52606d">worker</text>
+<rect x="340" y="655" width="16" height="12" rx="3" fill="#f1e8fb" stroke="#7a4fb5" stroke-width="1.3" stroke-dasharray="4 3"/>
+<text x="362" y="666.0" text-anchor="start" font-size="12" fill="#52606d">virtual IP</text>
+<rect x="490" y="655" width="16" height="12" rx="3" fill="#e8f1fb" stroke="#4a7fc1" stroke-width="1.3"/>
+<text x="512" y="666.0" text-anchor="start" font-size="12" fill="#52606d">network</text>
+<rect x="640" y="655" width="16" height="12" rx="3" fill="#eef0f2" stroke="#7b8794" stroke-width="1.3"/>
+<text x="662" y="666.0" text-anchor="start" font-size="12" fill="#52606d">outside the host</text>
+</svg>

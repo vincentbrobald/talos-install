@@ -1,0 +1,275 @@
+{#
+  Commented cluster file written by `deploy-talos.py template` (render_template).
+  Variables:
+    prog, preset, description   script name, preset name and its one-line description
+    name                        cluster name
+    ha, lan                     preset shape: several control planes / LAN mode
+    lan_bridge, lan_range       LAN values (placeholders unless given as options)
+    domain, realm, ca_example   example host names, Keycloak realm, CA file for oidc
+    secrets_dir                 paths.secretsDir, already as a YAML value ("..." or null)
+  Every key appears with its default so the file documents itself; keep it in
+  sync with SCHEMA in the script.
+#}
+{% set lan_section %}
+lan:
+  # Existing Linux bridge on the host that connects to the LAN.
+  bridge: {{ lan_bridge }}
+  # Unused LAN addresses, outside the router's DHCP pool. Layout: first
+  # address = Kubernetes API VIP, then the control planes; workers take
+  # addresses from the end of the range; the LoadBalancer pool for
+  # Gateways/Services is in between. Leave room if you plan to scale.
+  range: {{ lan_range }}
+  # null: use the host's default gateway / prefix length on the bridge.
+  gateway: null
+  prefixLength: null
+  # static: node LAN addresses from the range. dhcp: from the LAN's DHCP
+  # server, which registers the node names; the range then only holds the
+  # API VIP and the LoadBalancer pool.
+  addressing: static
+{% endset %}
+# Talos cluster definition for {{ prog }}
+# Preset: {{ preset }} - {{ description }}
+#
+#   {{ prog }} plan    -f <this file>   # validate and show the address plan
+#   {{ prog }} create  -f <this file>
+#   {{ prog }} scale   -f <this file>   # after changing workers.count
+#   {{ prog }} upgrade -f <this file>   # after changing talos.version
+#   {{ prog }} upgrade-k8s -f <this file>  # after changing talos.kubernetesVersion
+#   {{ prog }} destroy -f <this file>
+#
+# Only `name` is required; every other key falls back to the default
+# shown here. Unknown keys are rejected. Reference: docs/reference/cluster-file.md
+
+# 1-20 chars of [a-z0-9-]. Used for VM names (<name>-cp-1, <name>-w-1),
+# the libvirt network (talos-<name>) and the cluster directory.
+name: {{ name }}
+
+talos:
+  # Change later and run `{{ prog }} upgrade -f <file>` for a rolling upgrade.
+  version: v1.14.2
+  # null: the Kubernetes version bundled with this Talos release. Change
+  # later and run `{{ prog }} upgrade-k8s -f <file>` to upgrade Kubernetes.
+  kubernetesVersion: null
+  # Image Factory system extensions baked into the node image.
+  extensions:
+    - siderolabs/qemu-guest-agent
+
+# Private network carrying cluster traffic (etcd, kubelet, pods, Talos API).
+# prefix: first three octets of its /24. Nodes use .11-.19 (control
+# planes), .21-.90 (workers) and .91-.99 (longhorn storage nodes); .10 is
+# the API VIP with several control planes and no LAN.
+#
+# By default the script creates a libvirt NAT network for it (gateway
+# .1, DHCP reservations, DNS). Alternatively set existingBridge to attach
+# the nodes to a bridge that already exists on the host; they then get
+# static addresses, and the host needs an address in the prefix on it.
+network:
+  prefix: 10.44.0
+  # Created network only. null: talos-<name> / chosen by libvirt (virbrN).
+  name: null
+  bridgeName: null
+  # Existing bridge instead of a created network, e.g. br-talos.
+  existingBridge: null
+  # Existing bridge only: router on the private network (null: none; then
+  # a lan section must provide internet access) and DNS servers
+  # (null: Talos defaults 1.1.1.1 and 8.8.8.8).
+  gateway: null
+  nameservers: null
+
+controlPlanes:
+  count: {{ 3 if ha else 1 }}          # odd, 1-9
+  vcpus: 2          # at least 2
+  memory: 4096      # MiB, at least 2048
+  diskSize: 20G     # qemu-img size; thin-provisioned
+
+# Workers can be changed later: edit count, then `{{ prog }} scale -f <file>`.
+workers:
+  count: 2          # 0-70
+  vcpus: 2          # at least 1
+  memory: 4096      # MiB, at least 1024
+  diskSize: 20G
+
+# Optional LAN exposure. When present, every node gets a second NIC on the
+# bridge, the API is served on a LAN VIP, and Cilium replaces flannel and
+# kube-proxy (GatewayClass "cilium", LoadBalancer IPs announced via ARP).
+# Remove or comment out the whole section to keep the cluster internal.
+{# The LAN presets get the section active; the others get it commented out, ready to enable. #}
+{% for line in lan_section.splitlines() %}
+{{ line if lan else ('# ' ~ line) | trim }}
+{% endfor %}
+
+# Used in LAN mode only.
+cilium:
+  version: 1.20.2
+  gatewayApiVersion: v1.6.3   # Gateway API CRDs (the line this Cilium release expects)
+
+helm:
+  version: v4.3.0             # LAN mode only (installs Cilium)
+
+paths:
+  imagesDir: /var/lib/libvirt/images
+  # null: $XDG_CACHE_HOME/talos/<talos.version> (default ~/.cache/talos/...)
+  cacheDir: null
+  # null: <name>-cluster next to this file. Holds secrets, talosconfig
+  # and kubeconfig; relative paths are relative to this file.
+  clusterDir: null
+  # Directory with the credential files (SSH keys, passwords, tokens),
+  # kept out of git. Relative credential paths below (sshKeyFile,
+  # passwordFile, tokenFile, knownHosts, keycloakAdminPasswordFile,
+  # clientSecretFile) resolve against it. null: next to this file.
+  secretsDir: {{ secrets_dir }}
+
+libvirt:
+  uri: qemu:///system
+
+# Optional GitOps bootstrap. When present, Argo CD is installed and a root
+# Application syncs the repository automatically (prune + self-heal).
+# Credentials are only read from files named here, never written in
+# this file. Also usable on an existing cluster: {{ prog }} argocd -f <file>
+# argocd:
+#   chartVersion: 10.10.5     # argo-cd Helm chart (Argo CD v3.5.5)
+#   hostname: null            # LAN mode: UI only via a route, e.g. argocd.apps.{{ name }}.{{ domain }}
+#   repository:
+#     # ssh://git@host:2222/org/repo.git, git@host:org/repo.git or https://...
+#     url: https://git.example.com/org/gitops.git
+#     revision: HEAD          # branch, tag or commit
+#     path: .                 # directory with the manifests to sync
+#     recurse: false          # include subdirectories
+#     checkFromHost: true     # git ls-remote from this host before deploying
+#     auth:
+#       method: none          # none | ssh | basic | token
+#       # ssh:   sshKeyFile (no passphrase); knownHosts: auto | insecure | <file>
+#       #        e.g. sshKeyFile: git/deploy_key   (relative to paths.secretsDir)
+#       # basic: username + passwordFile
+#       # token: tokenFile; username optional (default "git")
+#       # Credentials are never written in this file: always a path to a
+#       # file holding them (mode 600, outside git).
+#       # https only: insecureSkipTLSVerify: true
+#   application:
+#     name: root
+#     namespace: default      # for manifests without a namespace
+#     prune: true
+#     selfHeal: true
+#   addons:                   # add-ons managed by Argo CD from this repository
+#     enabled: false          # true: Cilium, Argo CD, cert-manager, Headlamp, Longhorn... from Git
+#     path: null              # null: clusters/<name>
+#     pushSshKeyFile: null    # SSH repository: key with write access (pushes the definitions)
+#     pushTokenFile: null     # http(s) repository: token with write access
+#     sopsAgeKeyFile: null    # set: add-on Secrets in Git, SOPS-encrypted for this key (KSOPS); created if missing
+#     sopsRecipients: []      # more age public keys that can decrypt them (yours)
+#     content: generate       # generate: rewrite the files from this file each run; reuse: keep those in Git
+#     projects: {infra: platform-infra, services: platform-services}   # Argo CD projects of the generated Applications
+
+# Optional login through an OIDC provider (Keycloak). The API servers accept
+# its ID tokens, members of kubernetes.adminGroups get cluster-admin, and the
+# script writes <name>-cluster/kubeconfig-oidc (kubelogin, device code login).
+# With an argocd section, Argo CD gets single sign-on too. Existing clusters:
+# {{ prog }} oidc -f <file>
+# oidc:
+#   issuer: https://oauth.{{ domain }}/realms/{{ realm }}
+#   caFile: {{ ca_example }}        # CA of the issuer's certificate
+#   # Set to let the script create/update the realm, groups and clients:
+#   keycloakAdminUser: admin
+#   keycloakAdminPasswordFile: oauth/keycloak-admin-password   # relative to paths.secretsDir
+#   kubernetes:
+#     clientId: null            # null: k8s-<name>
+#     usernamePrefix: "oidc:"
+#     groupsPrefix: "oidc:"
+#     adminGroups: [k8s-admins]
+#   argocd:
+#     clientId: null            # null: argocd-<name>
+#     clientSecretFile: null    # required if Keycloak isn't managed by the script
+#     adminGroups: [argocd-admins]
+#   headlamp:                   # used with a headlamp section
+#     clientId: null            # null: headlamp-<name>
+#     clientSecretFile: null    # required if Keycloak isn't managed by the script
+#   grafana:                    # used with a monitoring section
+#     clientId: null            # null: grafana-<name>
+#     clientSecretFile: null    # required if Keycloak isn't managed by the script
+#     adminGroups: [grafana-admins]   # Grafana Admins; everyone else views
+#   crossplane:                 # Headlamp/Grafana clients as Crossplane objects in Git (needs SOPS add-ons)
+#     enabled: false
+#     providerConfig: default   # provider-keycloak ClusterProviderConfig
+#     observeOnly: false        # [Observe] only: for taking over existing clients
+
+# Optional HTTPS on the ingress gateway (LAN mode): cert-manager gets
+# certificates from an ACME CA (Let's Encrypt, step-ca, ...). They are proven
+# by HTTP-01, so the CA must resolve the host names to the gateway and reach
+# it on port 80. Each HTTPS host gets its own listener on port 443.
+# certManager:
+#   chartVersion: v1.21.2
+#   acmeServer: https://pki.{{ domain }}/acme/acme/directory
+#   caFile: {{ ca_example }}    # CA of the ACME server, when not publicly trusted
+#   email: null
+#   extraHosts: []          # more HTTPS hosts on the gateway, routes in Git: listener https-<first label>
+#   listenersLabel: deploy-talos/listeners   # namespaces labelled <this>=ingress may add listeners (ListenerSets)
+
+# Optional Headlamp web console. hostname: served over HTTPS on the ingress
+# gateway (needs certManager); null: port-forward only. With an oidc section,
+# users log in through Keycloak and act with their own Kubernetes
+# permissions. Existing clusters: {{ prog }} headlamp -f <file>
+# headlamp:
+#   chartVersion: 0.45.0
+#   hostname: headlamp.apps.{{ name }}.{{ domain }}
+
+# Optional Longhorn block storage on dedicated storage nodes <name>-st-N:
+# internal network only (with network.existingBridge, network.gateway is
+# required for their internet access), a second disk each for the data,
+# tainted so that only Longhorn runs there. All nodes get the iscsi-tools and
+# util-linux-tools extensions. Existing clusters: {{ prog }} longhorn -f <file>
+# longhorn:
+#   chartVersion: 1.13.0
+#   nodes:
+#     count: 3                  # 1-9; internal addresses .91-.99
+#     vcpus: 2
+#     memory: 4096              # MiB
+#     diskSize: 20G             # system disk
+#     dataDiskSize: 50G         # Longhorn data (thin)
+#   replicas: null              # per volume; null: min(3, nodes.count)
+#   defaultStorageClass: true   # 'longhorn' becomes the default StorageClass
+
+# Optional metrics-server: kubectl top and HorizontalPodAutoscaler (needs
+# argocd.addons). Existing clusters: {{ prog }} argocd -f <file>
+# metricsServer:
+#   chartVersion: 3.14.0
+
+# Optional monitoring: Prometheus, Alertmanager (no receivers) and Grafana
+# from kube-prometheus-stack (needs argocd.addons). hostname: Grafana over
+# HTTPS on the ingress gateway (needs certManager); null: port-forward only.
+# Volumes on Longhorn with a longhorn section. With an oidc section, Grafana
+# login through Keycloak. Existing clusters: {{ prog }} argocd -f <file>
+# monitoring:
+#   chartVersion: 92.8.0
+#   hostname: grafana.apps.{{ name }}.{{ domain }}
+#   retention: 7d
+#   storageSize: 10Gi           # Prometheus volume
+#   grafanaStorageSize: 1Gi
+
+# Optional tuppr: Talos and Kubernetes upgrades run by a controller in the
+# cluster from TalosUpgrade/KubernetesUpgrade resources in Git (needs
+# argocd.addons). 'upgrade' and 'upgrade-k8s' then push the new versions.
+# tuppr:
+#   chartVersion: 0.5.8
+
+# Optional etcd backups to S3 by talos-backup, encrypted with age (needs
+# argocd.addons). Credential files are relative to paths.secretsDir.
+# talosBackup:
+#   image: ghcr.io/siderolabs/talos-backup:v0.1.0-beta.3-10-gb9fd478
+#   schedule: "0 */6 * * *"
+#   s3:
+#     endpoint: https://backup.{{ domain }}
+#     bucket: talos-backups
+#     region: us-east-1
+#     accessKeyFile: backup/talos-backup-access-key
+#     secretKeyFile: backup/talos-backup-secret-key
+#     caFile: {{ ca_example }}
+#   agePublicKeyFile: backup/talos-backup-age.pub   # public key(s); keep the private key off the cluster
+#   compression: true
+
+# Optional registry mirror: every node pulls through it (fallback to the
+# upstream). It must keep each upstream under its own namespace, as zot's
+# on-demand sync does. Running nodes: {{ prog }} node-config -f <file>
+# registry:
+#   mirror: https://registry.{{ domain }}
+#   caFile: {{ ca_example }}
+#   registries: [docker.io, ghcr.io, quay.io, registry.k8s.io, gcr.io, factory.talos.dev]
