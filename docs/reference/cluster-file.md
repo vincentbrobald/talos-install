@@ -45,6 +45,9 @@ helm:
   version: v4.3.0
 paths:
   imagesDir: /var/lib/libvirt/images
+  controlPlaneImagesDir: null
+  workerImagesDir: null
+  storageImagesDir: null
   cacheDir: null
   clusterDir: null
   secretsDir: null
@@ -304,6 +307,7 @@ the internet.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `imagesDir` | string | `/var/lib/libvirt/images` | Where node disks and config ISOs go. Should be inside a libvirt storage pool. |
+| `controlPlaneImagesDir`, `workerImagesDir`, `storageImagesDir` | string or null | `null` → `imagesDir` | Another directory for one role's disks and config ISOs (a storage node's data disk too), e.g. control planes on an SSD: etcd waits for every write to reach the disk, and slow writes make the API servers fail. Read by `create`, `scale` and `destroy`; an existing node's files are moved by hand ([Move node disks](../how-to/move-node-disks.md)). |
 | `cacheDir` | string or null | `null` → `$XDG_CACHE_HOME/talos/<talos.version>`, i.e. `~/.cache/talos/<talos.version>` when `XDG_CACHE_HOME` is unset | Downloaded tools and images. Shared between clusters. |
 | `clusterDir` | string or null | `null` → `<name>-cluster` next to the cluster file | Secrets, generated configs, talosconfig, kubeconfig. |
 | `secretsDir` | string or null | `null` | Directory with the credential files (SSH keys, passwords, tokens), kept out of git. **Relative** credential paths resolve against it: `argocd.repository.auth.sshKeyFile`, `passwordFile`, `tokenFile`, a `knownHosts` file, `oidc.keycloakAdminPasswordFile`, `oidc.argocd.clientSecretFile` and `oidc.headlamp.clientSecretFile`. Absolute paths are used as is. `null`: relative paths resolve next to the cluster file. `oidc.caFile` (a public certificate) always resolves next to the cluster file. `template --secrets-dir DIR` sets it. |
@@ -326,5 +330,5 @@ resolved directories.
 | Credential files (keys, passwords, tokens) | relative to `paths.secretsDir`, else to the cluster file | `paths.secretsDir`, `template --secrets-dir`, absolute paths |
 | Cluster state (secrets, configs, kubeconfig) | `<name>-cluster` next to the cluster file | `paths.clusterDir` |
 | Tools and node images | `$XDG_CACHE_HOME/talos/<version>`, default `~/.cache/talos/<version>` | `paths.cacheDir`, or `XDG_CACHE_HOME` |
-| Node disks and config ISOs | `/var/lib/libvirt/images` | `paths.imagesDir` |
+| Node disks and config ISOs | `/var/lib/libvirt/images` | `paths.imagesDir`; per role `paths.controlPlaneImagesDir`, `workerImagesDir`, `storageImagesDir` |
 | libvirt | `qemu:///system` | `libvirt.uri` |

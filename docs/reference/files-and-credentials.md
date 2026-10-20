@@ -61,6 +61,9 @@ value itself.
 | `<imagesDir>/<node>.qcow2` | Node disk (holds the machine config) |
 | `<imagesDir>/<node>-data.qcow2` | Storage node data disk (`longhorn`) |
 | `<imagesDir>/<node>-cidata.iso` | Node config as cloud-init user-data |
+
+`<imagesDir>`: the node's role's directory when the cluster file sets one
+(`paths.controlPlaneImagesDir`, `workerImagesDir`, `storageImagesDir`).
 | `~/.kube/cache/oidc-login` | kubelogin's token cache |
 
 | Permission | Applies to |

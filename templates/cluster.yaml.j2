@@ -108,6 +108,11 @@ helm:
 
 paths:
   imagesDir: /var/lib/libvirt/images
+  # Per role, another directory for its nodes' disks and config ISOs (e.g.
+  # control planes on a faster disk: etcd waits on every write). null: imagesDir.
+  controlPlaneImagesDir: null
+  workerImagesDir: null
+  storageImagesDir: null
   # null: $XDG_CACHE_HOME/talos/<talos.version> (default ~/.cache/talos/...)
   cacheDir: null
   # null: <name>-cluster next to this file. Holds secrets, talosconfig

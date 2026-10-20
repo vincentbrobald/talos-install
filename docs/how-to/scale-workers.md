@@ -64,6 +64,26 @@ worker's disk, one worker at a time:
 
 Changed `vcpus` and `memory` likewise only apply to workers added later.
 
+## Give a running worker more CPUs or memory
+
+After changing `workers.vcpus` or `workers.memory` in the cluster file (so
+that workers added later match), one worker at a time:
+
+1. `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
+2. `talosctl -n <ip> shutdown`, then wait until `virsh domstate <node>` says
+   `shut off`.
+3. Change the VM's persistent definition:
+
+   ```sh
+   virsh setvcpus <node> <vcpus> --maximum --config && virsh setvcpus <node> <vcpus> --config
+   virsh setmaxmem <node> <MiB>M --config && virsh setmem <node> <MiB>M --config
+   ```
+
+4. `virsh start <node>`; when the node is `Ready` with the new capacity
+   (`kubectl get node <node> -o jsonpath='{.status.capacity.cpu}'`),
+   `kubectl uncordon <node>`.
+5. With Longhorn, wait until its volumes are healthy before the next worker.
+
 ## Limits
 
 - Control planes can't be scaled: `scale` refuses if `controlPlanes.count`

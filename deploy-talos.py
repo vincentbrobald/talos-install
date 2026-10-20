@@ -369,6 +369,9 @@ class Config:
     gateway_api_version: str
     helm_version: str
     images_dir: Path
+    # Per role (controlplane, worker, storage): where its nodes' disks and
+    # config ISOs go; images_dir unless the file names another one.
+    images_dirs: dict[str, Path]
     cache_dir: Path
     cluster_dir: Path
     secrets_dir: Path | None
@@ -437,6 +440,9 @@ SCHEMA = {
     },
     "paths": {
         "imagesDir": (str, "/var/lib/libvirt/images"),
+        "controlPlaneImagesDir": (str, None),
+        "workerImagesDir": (str, None),
+        "storageImagesDir": (str, None),
         "cacheDir": (str, None),
         "clusterDir": (str, None),
         "secretsDir": (str, None),
@@ -753,6 +759,9 @@ def load_config(path: Path) -> Config:
     base_dir = path.resolve().parent
     p = d["paths"]
     images_dir = _resolve(p["imagesDir"], base_dir)
+    images_dirs = {role: _resolve(p[key], base_dir) if p[key] else images_dir
+                   for role, key in (("controlplane", "controlPlaneImagesDir"), ("worker", "workerImagesDir"),
+                                     ("storage", "storageImagesDir"))}
     # Per-version cache by default: talosctl and the image must match the
     # Talos release, and old versions stay usable for clusters not upgraded yet.
     cache_dir = _resolve(p["cacheDir"], base_dir) if p["cacheDir"] else \
@@ -842,7 +851,7 @@ def load_config(path: Path) -> Config:
         nameservers=nameservers,
         control_planes=groups["controlPlanes"], workers=groups["workers"], lan=lan,
         cilium_version=c["version"].lstrip("v"), gateway_api_version=c["gatewayApiVersion"],
-        helm_version=d["helm"]["version"], images_dir=images_dir, cache_dir=cache_dir,
+        helm_version=d["helm"]["version"], images_dir=images_dir, images_dirs=images_dirs, cache_dir=cache_dir,
         cluster_dir=cluster_dir, secrets_dir=secrets_dir, libvirt_uri=d["libvirt"]["uri"],
     )
 
@@ -1351,6 +1360,13 @@ def node_group(cfg: Config, node: Node) -> NodeGroup:
     return {"controlplane": cfg.control_planes, "worker": cfg.workers}.get(node.role) or cfg.longhorn.nodes
 
 
+def node_files(cfg: Config, name: str, role: str) -> list[Path]:
+    """A node's files on the host: its disk, its config ISO and, for a
+    storage node, its data disk, in its role's images directory."""
+    d = cfg.images_dirs[role]
+    return [d / f"{name}.qcow2", d / f"{name}-cidata.iso"] + ([d / f"{name}-data.qcow2"] if role == "storage" else [])
+
+
 def talos_role(node: Node) -> str:
     """Talos machine type of a node: storage nodes are Talos workers."""
     return "controlplane" if node.role == "controlplane" else "worker"
@@ -1552,7 +1568,7 @@ class Deployer:
         for n in nodes(cfg):
             if self.virsh("dominfo", n.name, check=False).returncode == 0:
                 raise DeployError(f"domain '{n.name}' already exists")
-            for f in (cfg.images_dir / f"{n.name}.qcow2", cfg.images_dir / f"{n.name}-cidata.iso"):
+            for f in node_files(cfg, n.name, n.role)[:2]:
                 if f.exists():
                     raise DeployError(f"{f} already exists")
         if cfg.lan:
@@ -2263,8 +2279,7 @@ class Deployer:
         boot. Autostart brings the node back up when the host reboots."""
         cfg = self.cfg
         group = node_group(cfg, node)
-        disk = cfg.images_dir / f"{node.name}.qcow2"
-        iso = cfg.images_dir / f"{node.name}-cidata.iso"
+        disk, iso = node_files(cfg, node.name, node.role)[:2]
 
         old_umask = os.umask(0o077)  # ISO and disk carry the node's secrets
         try:
@@ -2286,7 +2301,7 @@ class Deployer:
         data_note = ""
         if node.role == "storage":
             # Second virtio disk (/dev/vdb): Longhorn's data, empty and thin.
-            data = cfg.images_dir / f"{node.name}-data.qcow2"
+            data = node_files(cfg, node.name, node.role)[2]
             run(["qemu-img", "create", "-q", "-f", "qcow2", str(data), cfg.longhorn.data_disk_size])
             disks += ["--disk", f"path={data},format=qcow2,bus=virtio,driver.discard=unmap"]
             data_note = f", data disk {cfg.longhorn.data_disk_size}"
@@ -4459,8 +4474,8 @@ class Deployer:
         by the LoadBalancer pool, and no machine answering on the addresses."""
         cfg = self.cfg
         for n in add:
-            for f in (cfg.images_dir / f"{n.name}.qcow2", cfg.images_dir / f"{n.name}-cidata.iso",
-                      cfg.images_dir / f"{n.name}-data.qcow2"):
+            d = cfg.images_dirs[n.role]
+            for f in (d / f"{n.name}.qcow2", d / f"{n.name}-cidata.iso", d / f"{n.name}-data.qcow2"):
                 if f.exists():
                     raise DeployError(f"{f} already exists (left over from an earlier node?)")
         if cfg.lan:
@@ -4561,8 +4576,7 @@ class Deployer:
                 else:
                     self.virsh("destroy", n.name)
             self.virsh("undefine", n.name, "--remove-all-storage")
-            for f in (cfg.images_dir / f"{n.name}.qcow2", cfg.images_dir / f"{n.name}-cidata.iso",
-                      cfg.cluster_dir / "nodes" / f"{n.name}.yaml"):
+            for f in node_files(cfg, n.name, n.role)[:2] + [cfg.cluster_dir / "nodes" / f"{n.name}.yaml"]:
                 f.unlink(missing_ok=True)
             if not cfg.existing_bridge:
                 self.dhcp_host("delete", n)
@@ -5670,8 +5684,8 @@ class Deployer:
             # --remove-all-storage deletes the VM's disks; anything libvirt
             # leaves behind (e.g. the read-only config ISO) is removed directly.
             self.virsh("undefine", name, "--remove-all-storage")
-            for f in (cfg.images_dir / f"{name}.qcow2", cfg.images_dir / f"{name}-cidata.iso",
-                      cfg.images_dir / f"{name}-data.qcow2"):
+            role = {"cp": "controlplane", "w": "worker", "st": "storage"}[pattern.fullmatch(name).group(1)]
+            for f in node_files(cfg, name, role):
                 f.unlink(missing_ok=True)
         info = self.virsh("net-info", cfg.network, check=False) if cfg.network else None
         if info and info.returncode == 0:

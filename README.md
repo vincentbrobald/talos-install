@@ -44,7 +44,8 @@ understand.
 | Task | Guide |
 |---|---|
 | Make clusters survive a host reboot | [Prepare the host](docs/how-to/prepare-the-host.md) |
-| More or fewer workers, bigger disks | [Scale workers](docs/how-to/scale-workers.md) |
+| More or fewer workers, bigger disks, more CPUs | [Scale workers](docs/how-to/scale-workers.md) |
+| Node disks on another (faster) disk | [Move node disks](docs/how-to/move-node-disks.md) |
 | New Talos release | [Upgrade Talos](docs/how-to/upgrade-talos.md) |
 | New Kubernetes release | [Upgrade Kubernetes](docs/how-to/upgrade-kubernetes.md) |
 | Let the cluster upgrade itself from Git | [Hand upgrades to tuppr](docs/how-to/hand-upgrades-to-tuppr.md) |
