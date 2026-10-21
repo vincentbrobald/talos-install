@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Draw the documentation's topology and integration diagrams as SVG files.
+
+Usage: diagrams.py [OUTPUT_DIR]. Writes topology-private.svg, topology-lan.svg and integrations.svg
+into OUTPUT_DIR (default: the directory of this script), overwriting them; the output is
+deterministic, so unchanged drawings give byte-identical files."""
+
 import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -18,7 +24,14 @@ FONT = "font-family=\"-apple-system,'Segoe UI',Helvetica,Arial,sans-serif\""
 
 
 class Svg:
+    """An SVG drawing built up as a list of elements, with helpers for the diagrams' boxes, lines
+    and labels.
+
+    Coordinates are in pixels from the top left; colours are keys of C (a box of kind k uses C[k] as
+    fill and C[k + 'b'] as border)."""
     def __init__(self, w, h, title, desc):
+        """Start a w x h drawing with an accessible title and description, the arrow marker and the
+        background."""
         self.w, self.h = w, h
         self.parts = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
@@ -31,6 +44,11 @@ class Svg:
         ]
 
     def box(self, x, y, w, h, kind, lines=(), title=None, dashed=False, rx=8, align="middle", size=13):
+        """Draw a rounded box of colour kind with an optional bold title at its top left and centred
+        text lines.
+
+        The first line is bold (unless there is a title) and darker; the others are one point
+        smaller and muted. align='start' left-aligns the lines."""
         dash = ' stroke-dasharray="6 4"' if dashed else ""
         self.parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" fill="{C[kind]}" '
                           f'stroke="{C[kind + "b"]}" stroke-width="1.5"{dash}/>')
@@ -47,12 +65,15 @@ class Svg:
                           color=C["ink"] if i == 0 else C["muted"])
 
     def text(self, x, y, s, bold=False, anchor="start", size=13, color=None, italic=False):
+        """Draw the text s at (x, y), y being the baseline; s is XML-escaped."""
         self.parts.append(f'<text x="{x}" y="{y:.1f}" text-anchor="{anchor}" font-size="{size}" '
                           f'fill="{color or C["ink"]}"{" font-weight=\"600\"" if bold else ""}'
                           f'{" font-style=\"italic\"" if italic else ""}>{escape(s)}</text>')
 
     def line(self, pts, arrow_end=True, arrow_start=False, dashed=False, color=None, label=None, lx=None, ly=None,
              anchor="middle"):
+        """Draw a polyline through pts, with arrow heads as requested and an optional label at (lx,
+        ly)."""
         d = " ".join(f"{'M' if i == 0 else 'L'}{x},{y}" for i, (x, y) in enumerate(pts))
         attrs = ""
         if arrow_end:
@@ -66,6 +87,9 @@ class Svg:
             self.label(lx, ly, label, anchor)
 
     def label(self, x, y, s, anchor="middle", size=12):
+        """Draw the text s at (x, y) on a light background so it stays readable over lines.
+
+        The background width is estimated from the number of characters."""
         w = len(s) * size * 0.56 + 10
         x0 = {"middle": x - w / 2, "start": x - 5, "end": x - w + 5}[anchor]
         self.parts.append(f'<rect x="{x0:.1f}" y="{y - size - 1}" width="{w:.1f}" height="{size + 7}" rx="3" '
@@ -73,6 +97,7 @@ class Svg:
         self.text(x, y + 1, s, anchor=anchor, size=size, color=C["muted"])
 
     def legend(self, x, y, items):
+        """Draw a row of legend entries (kind, text, dashed), 150 pixels apart, starting at (x, y)."""
         for i, (kind, s, dashed) in enumerate(items):
             xx = x + i * 150
             dash = ' stroke-dasharray="4 3"' if dashed else ""
@@ -81,6 +106,7 @@ class Svg:
             self.text(xx + 22, y, s, size=12, color=C["muted"])
 
     def save(self, path):
+        """Close the drawing and write it to path."""
         self.parts.append("</svg>")
         Path(path).write_text("\n".join(self.parts) + "\n")
 
@@ -90,6 +116,7 @@ LEGEND = [("cp", "control plane", False), ("wk", "worker", False), ("vip", "virt
 
 
 def talos_private(out):
+    """Draw the topology of a cluster on its private network only, to the file out."""
     s = Svg(900, 680, "Talos: private network topology",
             "Nodes on a libvirt NAT network created for the cluster; only the host reaches them.")
     s.text(20, 32, "Talos — private network (default)", bold=True, size=18)
@@ -120,6 +147,7 @@ def talos_private(out):
 
 
 def talos_lan(out):
+    """Draw the topology of a cluster in LAN mode (lan section), to the file out."""
     s = Svg(900, 780, "Talos: LAN mode topology",
             "Each node has a private NIC for cluster traffic and a LAN NIC; API VIP, Gateway and "
             "LoadBalancer addresses come from lan.range.")
@@ -163,6 +191,7 @@ def talos_lan(out):
 
 
 def integrations(out):
+    """Draw how a cluster uses Keycloak, a Git server and the LAN DNS, to the file out."""
     title = "Talos"
     s = Svg(900, 600, f"{title}: integrations",
             "How a cluster uses Keycloak, a Git server and the LAN DNS, and what the deploy script configures.")
