@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""Generate the SVGs of this repository's documentation (docs/*.svg).
-
-Usage: docs/diagrams.py [docs directory]
-Standard library only; edit the layout functions and re-run."""
 import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -93,7 +89,6 @@ LEGEND = [("cp", "control plane", False), ("wk", "worker", False), ("vip", "virt
           ("net", "network", False), ("ext", "outside the host", False)]
 
 
-# ---------------------------------------------------------------- Talos ----
 def talos_private(out):
     s = Svg(900, 680, "Talos: private network topology",
             "Nodes on a libvirt NAT network created for the cluster; only the host reaches them.")
@@ -167,7 +162,6 @@ def talos_lan(out):
     s.save(out)
 
 
-# --------------------------------------------------------- integrations ----
 def integrations(out):
     title = "Talos"
     s = Svg(900, 600, f"{title}: integrations",

@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy Talos Linux Kubernetes clusters on the local qemu/kvm via libvirt.
-
-Clusters are described in a YAML file (see `deploy-talos.py template --help`
-and docs/reference/cluster-file.md). Each cluster gets its own libvirt NAT network with fixed
-node addresses; nodes boot the Talos "nocloud" image from the Image Factory and
-receive their machine config as cloud-init user-data, so they come up fully
-configured. An optional LAN mode adds a NIC on an existing host bridge, serves
-the Kubernetes API on a LAN VIP and installs Cilium (Gateway API + LoadBalancer
-IPs announced on the LAN).
-
-talosctl, kubectl and helm are downloaded, checksum-verified, into a cache
-directory; nothing is installed system-wide.
-
-Layout of this file, top to bottom:
-- Configuration: the cluster file's schema, validation and the resolved Config;
-- Inventory: the address plan (node names, IPs and MACs derived from the file);
-- Helpers: running commands, downloads;
-- Deployer: everything that touches the host or a cluster, grouped by command
-  (checks, downloads, machine configs, libvirt, bring-up, Cilium, Argo CD,
-  scaling, Talos upgrades, OIDC, Kubernetes upgrades, create/destroy);
-- plan / template: the plan summary and the commented cluster file, both
-  rendered from Jinja2 templates in templates/ next to this script;
-- CLI: argument parsing and dispatch.
-
-Conventions: problems the user can fix raise DeployError (printed as
+"""Conventions: problems the user can fix raise DeployError (printed as
 "ERROR: ..." with exit status 1, no traceback); commands are written to be
 re-run after a failure and continue where they stopped; credentials are read
 from files only and passed to tools via stdin or the environment, never on a
@@ -62,51 +38,38 @@ import yaml
 PROG = "deploy-talos.py"
 FACTORY_URL = "https://factory.talos.dev"
 NODE_LINK = "eth0"   # nocloud images boot with net.ifnames=0
-LAN_LINK = "eth1"    # second NIC, on the LAN bridge
-KUBELOGIN_VERSION = "v1.36.4"   # kubectl OIDC login plugin (OIDC mode)
-MIN_TALOS = (1, 14, 0)          # oldest Talos release whose config documents the script uses
-STORAGE_TAINT = "deploy-talos/role=storage"   # label and NoSchedule taint of the Longhorn storage nodes
+LAN_LINK = "eth1"
+KUBELOGIN_VERSION = "v1.36.4"
+MIN_TALOS = (1, 14, 0)
+STORAGE_TAINT = "deploy-talos/role=storage"
 LONGHORN_NS = "longhorn-system"
 # Namespace labels for components with privileged pods (Talos enforces "baseline").
 PRIVILEGED_NS = {f"pod-security.kubernetes.io/{m}": "privileged" for m in ("enforce", "audit", "warn")}
-# Compare with what the API server would store (a server-side dry run): the
-# defaults it fills in (Gateway API routes, cert-manager issuers) are then not
-# reported as differences.
-# Argo CD projects of the generated add-ons (argocd.addons.projects): those
-# that need nothing cluster-wide but their namespace go to the "services"
-# project, the others to the "infra" one. The app-of-apps stays in default:
-# it creates the projects, so it can't wait for one.
 SERVICE_APPS = {"headlamp", "ingress", "talos-backup"}
 
 
 def project_of(app: str, projects: dict[str, str]) -> str:
-    """The Argo CD project of a generated add-on Application."""
     return projects["services"] if app in SERVICE_APPS else projects["infra"]
 
 
 # A Kubernetes label key: optional DNS-subdomain prefix, then a name of up to 63 characters.
 LABEL_KEY_RE = r"(?:[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?"
+# Compare with what the API server would store (a server-side dry run): the
+# defaults it fills in (Gateway API routes, cert-manager issuers) are then not
+# reported as differences.
 SERVER_SIDE_DIFF = {"argocd.argoproj.io/compare-options": "ServerSideDiff=true"}
-BACKUP_NS = "talos-backup"     # the etcd backup CronJob; it gets os:etcd:backup on the Talos API
+BACKUP_NS = "talos-backup"
 POD_SUBNET = "10.244.0.0/16"  # Talos' default pod network (KubeNetworkConfig.podSubnets)
 TUPPR_NS = "system-upgrade"
-MONITORING_NS = "monitoring"   # kube-prometheus-stack (Prometheus, Alertmanager, Grafana)
-TUPPR_CHARTS = "ghcr.io/home-operations/charts"   # OCI registry of the tuppr chart   # tuppr's namespace; it gets os:admin on the Talos API
+MONITORING_NS = "monitoring"
+TUPPR_CHARTS = "ghcr.io/home-operations/charts"
 SOPS_VERSION = "v3.13.3"
-KSOPS_IMAGE = "viaductoss/ksops:v4.5.1"   # init container putting ksops into Argo CD's repo server
-SOPS_SECRET = "sops-age"                # the cluster's age key, in namespace argocd (outside Git)
-ADDONS_APP = "addons"           # Argo CD app-of-apps syncing <argocd.addons.path>/addons
-# Under argocd.addons.path, what the script owns entirely: its Applications
-# (GENERATED_APPS, synced by the app-of-apps with those added by hand in
-# addons/) and its manifests and Secrets by topic (GENERATED/<topic>/), each
-# synced with the topic's add-on; CHECKSUMS lists every generated file, so
-# that a check in the repository can refuse edits by hand.
+KSOPS_IMAGE = "viaductoss/ksops:v4.5.1"
+SOPS_SECRET = "sops-age"
+ADDONS_APP = "addons"
 GENERATED_APPS = "addons/generated"
 GENERATED = "generated"
 CHECKSUMS = f"{GENERATED}/CHECKSUMS"
-# The topic of a generated object: by namespace (a Namespace by its name), or
-# by kind for cluster-scoped ones. A topic is synced by the Application of the
-# same name (a chart's, as a second source) or by its own (TOPIC_NAMESPACE).
 TOPIC_BY_NAMESPACE = {"argocd": "argocd", "headlamp": "headlamp", MONITORING_NS: "monitoring",
                       BACKUP_NS: "talos-backup", "ingress": "ingress"}
 TOPIC_BY_KIND = {"ClusterIssuer": "cert-manager", "TalosUpgrade": "tuppr", "KubernetesUpgrade": "tuppr"}
@@ -123,13 +86,8 @@ def log(msg: str) -> None:
     print(f"==> {msg}", flush=True)
 
 
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
 @dataclasses.dataclass
 class NodeGroup:
-    """Size of the control planes or of the workers (all nodes of a group alike)."""
     count: int
     vcpus: int
     memory: int        # MiB
@@ -138,8 +96,8 @@ class NodeGroup:
 
 @dataclasses.dataclass
 class Lan:
-    """The 'lan' section. gateway and prefix_length may be None in the file;
-    resolve_lan() fills them in from the host's bridge before they are used."""
+    """gateway and prefix_length may be None in the file; resolve_lan() fills them in
+    from the host's bridge before they are used."""
     bridge: str
     range: str
     gateway: str | None
@@ -156,8 +114,7 @@ class Lan:
 
 @dataclasses.dataclass
 class Repository:
-    """The Git repository Argo CD syncs, and how to authenticate to it. Only
-    the file paths of credentials are kept here; their content is read when
+    """Only the file paths of credentials are kept here; their content is read when
     needed (read_secret)."""
     url: str
     revision: str
@@ -175,29 +132,23 @@ class Repository:
 
 @dataclasses.dataclass
 class Addons:
-    """argocd.addons: the add-ons (Cilium, Argo CD, cert-manager, Headlamp,
-    Longhorn, gateway and routes) defined in the repository and synced by Argo
-    CD, instead of installed with Helm. The script writes the definitions
-    under path and pushes them with the push credential (write access)."""
-    path: str                       # directory in the repository, e.g. clusters/lab
-    push_ssh_key_file: Path | None  # ssh repositories
-    push_token_file: Path | None    # http(s) repositories
-    sops_key_file: Path | None = None    # set: Secrets go to Git, SOPS-encrypted (KSOPS)
-    sops_recipients: list[str] = dataclasses.field(default_factory=list)   # more age public keys
+    path: str
+    push_ssh_key_file: Path | None
+    push_token_file: Path | None
+    sops_key_file: Path | None = None
+    sops_recipients: list[str] = dataclasses.field(default_factory=list)
     content: str = "generate"       # generate: rewrite the files each run; reuse: keep those in Git
-    # The Argo CD projects of the generated Applications (the repository provides them).
     projects: dict[str, str] = dataclasses.field(
         default_factory=lambda: {"infra": "platform-infra", "services": "platform-services"})
 
 
 @dataclasses.dataclass
 class ArgoCD:
-    """The 'argocd' section: Helm chart, repository and root Application."""
     chart_version: str
-    hostname: str | None          # UI only through a TLSRoute on the ingress gateway
+    hostname: str | None
     repo: Repository
     app_name: str
-    app_namespace: str           # destination namespace for namespace-less manifests
+    app_namespace: str
     prune: bool
     self_heal: bool
     addons: Addons | None = None  # None: add-ons installed with Helm
@@ -206,13 +157,10 @@ class ArgoCD:
 
 @dataclasses.dataclass
 class Oidc:
-    """The 'oidc' section. Two modes: "managed" (an admin password file is
-    given) where the script creates the Keycloak realm, groups and clients
-    itself, or pre-configured clients where it only uses them."""
     issuer: str
     ca_file: Path | None
     keycloak_admin_user: str
-    keycloak_admin_password_file: Path | None   # set: the script manages realm, groups and clients
+    keycloak_admin_password_file: Path | None
     k8s_client_id: str
     username_prefix: str
     groups_prefix: str
@@ -225,15 +173,12 @@ class Oidc:
     grafana_client_id: str | None = None           # set when the file has a monitoring section
     grafana_client_secret_file: Path | None = None
     grafana_admin_groups: list[str] = dataclasses.field(default_factory=list)
-    # oidc.crossplane: the Headlamp and Grafana clients (and Grafana's admin
-    # groups) are Crossplane objects in the repository instead of API calls.
     crossplane: bool = False
     crossplane_provider_config: str = "default"
     crossplane_observe_only: bool = False
 
     @property
     def managed(self) -> bool:
-        """The script may administer Keycloak (realm, groups, clients)."""
         return self.keycloak_admin_password_file is not None
 
     @property
@@ -243,75 +188,55 @@ class Oidc:
 
     @property
     def keycloak_url(self) -> str:
-        """Keycloak base URL: the issuer without /realms/<realm>."""
         return self.issuer.rstrip("/").rsplit("/realms/", 1)[0]
 
 
 @dataclasses.dataclass
 class CertManager:
-    """The 'certManager' section: cert-manager with an ACME issuer (e.g. a
-    private step-ca), giving the ingress gateway HTTPS listeners."""
     chart_version: str
     acme_server: str
-    ca_file: Path | None          # CA of the ACME server, when it isn't publicly trusted
+    ca_file: Path | None
     email: str | None
-    # More HTTPS hosts on the ingress gateway: a listener https-<first label>
-    # and a certificate each; the routes to them are the application's own
-    # (in Git, attached to that listener).
     extra_hosts: list[str] = dataclasses.field(default_factory=list)
-    # Namespaces with this label (value "ingress") may add HTTPS listeners
-    # to the gateway with a ListenerSet.
     listeners_label: str = "deploy-talos/listeners"
 
 
 @dataclasses.dataclass
 class Headlamp:
-    """The 'headlamp' section: the Headlamp web console."""
     chart_version: str
-    hostname: str | None          # served over HTTPS on the ingress gateway; None: port-forward only
+    hostname: str | None
 
 
 @dataclasses.dataclass
 class Longhorn:
-    """The 'longhorn' section: Longhorn block storage on dedicated storage
-    nodes (<name>-st-N), each with a data disk of its own."""
     chart_version: str
     nodes: NodeGroup              # the storage nodes; disk_size is their system disk
-    data_disk_size: str           # second disk, Longhorn's data (/var/mnt/longhorn)
-    replicas: int                 # replicas per volume (default StorageClass)
-    default_class: bool           # make 'longhorn' the cluster's default StorageClass
+    data_disk_size: str
+    replicas: int
+    default_class: bool
 
 
 @dataclasses.dataclass
 class MetricsServer:
-    """The 'metricsServer' section: the resource metrics API (kubectl top,
-    HorizontalPodAutoscaler)."""
     chart_version: str
 
 
 @dataclasses.dataclass
 class Monitoring:
-    """The 'monitoring' section: kube-prometheus-stack (Prometheus,
-    Alertmanager, Grafana, node-exporter, kube-state-metrics)."""
     chart_version: str
-    hostname: str | None          # Grafana over HTTPS on the ingress gateway; None: port-forward only
-    retention: str                # how long Prometheus keeps samples
-    storage_size: str             # Prometheus volume (Longhorn); no volume without a longhorn section
-    grafana_storage_size: str     # Grafana's volume (users, preferences, dashboards made in the UI)
+    hostname: str | None
+    retention: str
+    storage_size: str
+    grafana_storage_size: str
 
 
 @dataclasses.dataclass
 class Tuppr:
-    """The 'tuppr' section: Talos and Kubernetes upgrades run by the tuppr
-    controller from TalosUpgrade/KubernetesUpgrade resources in Git."""
     chart_version: str
 
 
 @dataclasses.dataclass
 class TalosBackup:
-    """The 'talosBackup' section: encrypted etcd snapshots to S3 by a
-    talos-backup CronJob. Credentials are files; only their content goes to
-    the cluster, as a Secret."""
     image: str
     schedule: str
     endpoint: str
@@ -319,20 +244,16 @@ class TalosBackup:
     region: str
     access_key_file: Path
     secret_key_file: Path
-    ca_file: Path | None            # CA of the S3 endpoint, when not publicly trusted
+    ca_file: Path | None
     age_public_key_file: Path       # age recipient(s), one per line; the private key stays off the cluster
     compression: bool
 
 
 @dataclasses.dataclass
 class Omni:
-    """The 'omni' section: the cluster is imported into Omni (Sidero Labs'
-    console and API for Talos clusters) with the 'omni' command. Omni keeps
-    it locked: it records the nodes' configs and changes nothing until
-    unlocked in Omni (omnictl cluster unlock <name>)."""
-    endpoint: str                   # https://omni.example.com
+    endpoint: str
     service_account_key_file: Path  # an Omni service account key (Operator or Admin)
-    ca_file: Path | None            # CA of Omni's certificate: the nodes trust it, omnictl too
+    ca_file: Path | None
     omnictl_version: str
 
 
@@ -343,24 +264,24 @@ class Registry:
     projects named after the upstream, or zot with on-demand sync:
     <mirror>/docker.io/library/nginx for docker.io/library/nginx)."""
     mirror: str                     # https://host[:port]
-    ca_file: Path | None            # CA of the mirror's certificate
-    registries: list[str]           # upstreams sent through the mirror
+    ca_file: Path | None
+    registries: list[str]
 
 
 @dataclasses.dataclass
 class Config:
     """A validated cluster file, with defaults applied and paths made
     absolute. Built only by load_config()."""
-    source: Path                      # the cluster file itself
+    source: Path
     name: str
     talos_version: str
     kubernetes_version: str | None
     extensions: list[str]
     net_prefix: str
-    net_name: str | None              # libvirt network to create (None: existing bridge)
-    net_bridge_name: str | None       # bridge device for the created network
-    existing_bridge: str | None       # attach to this host bridge instead
-    net_gateway: str | None           # existing bridge: router on the private network
+    net_name: str | None
+    net_bridge_name: str | None
+    existing_bridge: str | None
+    net_gateway: str | None
     nameservers: list[str]            # existing bridge: DNS servers ([] = Talos defaults)
     control_planes: NodeGroup
     workers: NodeGroup
@@ -369,8 +290,6 @@ class Config:
     gateway_api_version: str
     helm_version: str
     images_dir: Path
-    # Per role (controlplane, worker, storage): where its nodes' disks and
-    # config ISOs go; images_dir unless the file names another one.
     images_dirs: dict[str, Path]
     cache_dir: Path
     cluster_dir: Path
@@ -390,7 +309,6 @@ class Config:
 
     @property
     def network(self) -> str | None:
-        """Name of the libvirt network the script creates, None on an existing bridge."""
         return self.net_name
 
 
@@ -585,20 +503,15 @@ SCHEMA["omni"] = {
     "omnictlVersion": (str, "v1.12.2"),
 }
 OPTIONAL_SECTIONS = {"lan", "argocd", "oidc", "certManager", "headlamp", "longhorn", "tuppr", "talosBackup",
-                     "registry", "metricsServer", "monitoring", "omni"}   # absent section = feature disabled
+                     "registry", "metricsServer", "monitoring", "omni"}
 
 
 def _apply_schema(data, schema, path: str) -> dict:
-    """Check one level of the cluster file against SCHEMA, recursively:
-    reject unknown and removed keys, check types, fill in defaults. path is
-    the dotted location used in error messages ('' at the top level)."""
     if data is None:
         data = {}
     if not isinstance(data, dict):
         raise DeployError(f"{path or 'top level'}: expected a mapping")
     unknown = set(data) - set(schema)
-    # Keys that existed in earlier versions get a specific hint instead of
-    # the generic "unknown key" error.
     for key in sorted(unknown & set(REMOVED_KEYS)):
         raise DeployError(f"'{path}.{key}' is no longer supported: {REMOVED_KEYS[key]}")
     if unknown:
@@ -608,16 +521,14 @@ def _apply_schema(data, schema, path: str) -> dict:
     for key, spec in schema.items():
         full = f"{path}.{key}" if path else key
         if isinstance(spec, dict):
-            # A missing optional section stays None (feature off) instead of
-            # being filled with defaults; every other section is always filled.
-            if not path and key in OPTIONAL_SECTIONS and data.get(key) is None:   # top level only
+            if not path and key in OPTIONAL_SECTIONS and data.get(key) is None:
                 out[key] = None
             else:
                 out[key] = _apply_schema(data.get(key), spec, full)
             continue
         typ, default = spec
         value = data.get(key)
-        if value is None:          # absent or written as null
+        if value is None:
             if default is REQUIRED:
                 raise DeployError(f"'{full}' is required")
             out[key] = default
@@ -636,15 +547,11 @@ def _apply_schema(data, schema, path: str) -> dict:
 
 
 def _check(cond: bool, msg: str) -> None:
-    """Raise DeployError(msg) unless cond holds: keeps the validation rules one-liners."""
     if not cond:
         raise DeployError(msg)
 
 
 def load_config(path: Path) -> Config:
-    """Read and validate a cluster file. Checks everything that can be checked
-    without touching the host (formats, ranges, combinations of settings);
-    the host checks are in Deployer.preflight()."""
     try:
         raw = yaml.safe_load(path.read_text())
     except OSError as e:
@@ -668,17 +575,12 @@ def load_config(path: Path) -> Config:
         _check(re.fullmatch(r"\d+\.\d+\.\d+", kv) is not None, "'talos.kubernetesVersion' must look like 1.37.1")
     _check(all(isinstance(e, str) and e for e in t["extensions"]), "'talos.extensions' must be a list of names")
 
-    # The private network is either created by the script (libvirt NAT network
-    # with DHCP reservations) or an existing host bridge (static addresses):
-    # some keys only make sense in one of the two modes.
     nd = d["network"]
     prefix = nd["prefix"]
     _check(_is_prefix24(prefix), "'network.prefix' must be the first three octets of a /24, e.g. 10.44.0")
     existing = nd["existingBridge"]
     net_name = None
     if existing:
-        # Existing bridge: static addressing, so the router and DNS servers
-        # must come from the file (no libvirt DHCP to provide them).
         _check(nd["name"] is None and nd["bridgeName"] is None,
                "'network.name' and 'network.bridgeName' only apply when the script creates the network; "
                "remove them or 'network.existingBridge'")
@@ -693,7 +595,6 @@ def load_config(path: Path) -> Config:
         _check(all(isinstance(ns, str) and _is_ipv4(ns) for ns in nameservers),
                "'network.nameservers' must be a list of IPv4 addresses")
     else:
-        # Created network: libvirt is the router (.1) and DNS, via DHCP.
         _check(nd["gateway"] is None and nd["nameservers"] is None,
                "'network.gateway' and 'network.nameservers' only apply with 'network.existingBridge' "
                "(a created network provides both via DHCP)")
@@ -721,17 +622,15 @@ def load_config(path: Path) -> Config:
     lan = None
     if d["lan"] is not None:
         ld = d["lan"]
-        # "a.b.c.X-Y": a range within one /24, given as first and last octet.
         m = re.fullmatch(r"(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})", ld["range"])
         _check(m is not None and _is_prefix24(m.group(1)), "'lan.range' must look like 192.0.2.200-229")
         base, first, last = m.group(1), int(m.group(2)), int(m.group(3))
         _check(1 <= first <= last <= 254, "'lan.range' out of bounds (last octet 1-254, first <= last)")
         _check(ld["addressing"] in ("static", "dhcp"), "'lan.addressing' must be static or dhcp")
         # Whether the range fits the subnet is checked later (resolve_lan), as
-        # the subnet may come from the host. With DHCP the nodes take no
-        # address from it: only the VIP and the LoadBalancer pool.
+        # the subnet may come from the host.
         node_ips = 0 if ld["addressing"] == "dhcp" else groups["controlPlanes"].count + groups["workers"].count
-        needed = 1 + node_ips + 1  # VIP, nodes, >= 1 pool IP
+        needed = 1 + node_ips + 1
         have = last - first + 1
         _check(have >= needed, f"'lan.range' has {have} addresses; need at least {needed} "
                                + ("(API VIP + 1 LoadBalancer IP)" if not node_ips
@@ -742,8 +641,6 @@ def load_config(path: Path) -> Config:
             _check(1 <= ld["prefixLength"] <= 30, "'lan.prefixLength' must be 1-30")
         lan = Lan(ld["bridge"], ld["range"], ld["gateway"], ld["prefixLength"], base, first, last, ld["addressing"])
         _check(ld["bridge"] != existing, "'lan.bridge' and 'network.existingBridge' must be different bridges")
-    # Talos pulls its images at boot: on an existing bridge without a router,
-    # only a LAN NIC (with its own default route) can reach the internet.
     if existing and lan is None and nd["gateway"] is None:
         raise DeployError("with 'network.existingBridge' the nodes need a way out to pull images: "
                           "set 'network.gateway' or add a 'lan' section")
@@ -754,8 +651,6 @@ def load_config(path: Path) -> Config:
            "'cilium.gatewayApiVersion' must look like v1.6.3")
     _check(re.fullmatch(r"v\d+\.\d+\.\d+", d["helm"]["version"]) is not None, "'helm.version' must look like v4.3.0")
 
-    # Relative paths in the file are relative to the file, not to the current
-    # directory, so a cluster file works wherever the command is run from.
     base_dir = path.resolve().parent
     p = d["paths"]
     images_dir = _resolve(p["imagesDir"], base_dir)
@@ -767,8 +662,6 @@ def load_config(path: Path) -> Config:
     cache_dir = _resolve(p["cacheDir"], base_dir) if p["cacheDir"] else \
         _cache_home() / "talos" / t["version"]
     cluster_dir = _resolve(p["clusterDir"], base_dir) if p["clusterDir"] else base_dir / f"{name}-cluster"
-    # Credential files given as relative paths resolve against secretsDir (a
-    # tree kept out of git), else against this file's directory.
     secrets_dir = _resolve(p["secretsDir"], base_dir) if p["secretsDir"] else None
     secret_base = secrets_dir or base_dir
 
@@ -813,7 +706,6 @@ def load_config(path: Path) -> Config:
                "'omni.endpoint' must look like https://omni.example.com[:port]")
         _check(re.fullmatch(r"v\d+\.\d+\.\d+", o["omnictlVersion"]) is not None,
                "'omni.omnictlVersion' must look like v1.12.2 (the version of the Omni server)")
-        # The key is a credential (secretsDir); the CA a public certificate (next to the file).
         omni = Omni(o["endpoint"].rstrip("/"), _resolve(o["serviceAccountKeyFile"], secret_base),
                     _resolve(o["caFile"], base_dir) if o["caFile"] else None, o["omnictlVersion"])
     talos_backup = None
@@ -833,8 +725,6 @@ def load_config(path: Path) -> Config:
             _resolve(b["agePublicKeyFile"], secret_base), b["compression"])
     extensions = list(t["extensions"])
     if longhorn:
-        # Storage nodes have no LAN NIC: on an existing bridge they reach the
-        # internet (image pulls) only through network.gateway.
         _check(not existing or nd["gateway"] is not None,
                "the 'longhorn' storage nodes are on the internal network only: with 'network.existingBridge' "
                "set 'network.gateway' (the bridge's router) so they can pull images")
@@ -867,8 +757,6 @@ CREDENTIAL_KEYS = {
     "basic": {"username", "passwordFile"},
     "token": {"username", "tokenFile"},
 }
-# Keys of earlier versions that held or pointed at credentials outside files.
-# Credentials are only ever read from files, never from the cluster file itself.
 REMOVED_KEYS = {
     "passwordEnv": "credentials are read from files only: put the password in a file and set 'passwordFile'",
     "tokenEnv": "credentials are read from files only: put the token in a file and set 'tokenFile'",
@@ -876,15 +764,13 @@ REMOVED_KEYS = {
 
 
 def ssh_host_port(url: str) -> tuple[str, int]:
-    """(host, port) of an SSH repository URL in either form; port 22 by default."""
     m = SSH_URL.fullmatch(url) or SCP_URL.fullmatch(url)
     return m.group("host"), int(m.groupdict().get("port") or 22)
 
 
 def _load_argocd(a: dict, base_dir: Path, lan: bool, cluster: str) -> ArgoCD:
-    """Validate the 'argocd' section: URL form vs. auth method, exactly the
-    credential keys the method uses, Kubernetes-valid names. base_dir: where
-    relative credential paths resolve (paths.secretsDir or the file's directory)."""
+    """base_dir: where relative credential paths resolve (paths.secretsDir or the
+    file's directory)."""
     _check(re.fullmatch(r"\d+\.\d+\.\d+", a["chartVersion"]) is not None,
            "'argocd.chartVersion' must look like 10.9.6 (argo-cd Helm chart version)")
     if a["hostname"] is not None:
@@ -901,8 +787,6 @@ def _load_argocd(a: dict, base_dir: Path, lan: bool, cluster: str) -> ArgoCD:
         _check(is_ssh, "auth method 'ssh' needs an ssh:// or user@host:path repository URL")
     else:
         _check(is_http, f"auth method '{method}' needs an http(s):// repository URL (use method: ssh for SSH URLs)")
-    # A credential key the chosen method doesn't use is an error rather than
-    # ignored: it usually means the method is not the one intended.
     for key in ("username", "passwordFile", "tokenFile", "sshKeyFile"):
         if auth[key] is not None and key not in CREDENTIAL_KEYS[method]:
             raise DeployError(f"'argocd.repository.auth.{key}' is not used with method '{method}'")
@@ -927,7 +811,7 @@ def _load_argocd(a: dict, base_dir: Path, lan: bool, cluster: str) -> ArgoCD:
     def file(key):
         return _resolve(auth[key], base_dir) if auth[key] else None
     known = auth["knownHosts"]
-    if known not in ("auto", "insecure"):   # anything else is a known_hosts file
+    if known not in ("auto", "insecure"):
         known = str(_resolve(known, base_dir))
     repo = Repository(
         url=url, revision=r["revision"], path=r["path"], recurse=r["recurse"], method=method,
@@ -938,8 +822,6 @@ def _load_argocd(a: dict, base_dir: Path, lan: bool, cluster: str) -> ArgoCD:
         known_hosts=known, insecure_tls=auth["insecureSkipTLSVerify"], check_from_host=r["checkFromHost"])
     ad, addons = a["addons"], None
     if ad["enabled"]:
-        # Pushing needs write access, which Argo CD's own (read) credential
-        # should not have: a separate key or token.
         if is_ssh:
             _check(ad["pushSshKeyFile"] is not None and ad["pushTokenFile"] is None,
                    "'argocd.addons' with an SSH repository needs 'pushSshKeyFile' (a key with write access)")
@@ -976,22 +858,17 @@ def _load_argocd(a: dict, base_dir: Path, lan: bool, cluster: str) -> ArgoCD:
 
 
 def _semver(v: str) -> tuple[int, int, int]:
-    """'v1.14.2' or '1.14.2' -> (1, 14, 2), for comparisons."""
     return tuple(int(x) for x in v.lstrip("v").split("."))
 
 
 def _satisfies(version: str, constraint: str) -> bool | None:
-    """Check a version against a Helm/semver kubeVersion constraint such as
-    '>= 1.21.0-0' or '>=1.25.0-0 <1.40.0-0' ('||' for alternatives). None if
-    the constraint is empty or uses syntax this simple checker doesn't know."""
+    """None if the constraint is empty or uses syntax this simple checker doesn't
+    know."""
     if not constraint.strip():
         return None
     v = _semver(version)
     ops = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b,
            "<": lambda a, b: a < b, "=": lambda a, b: a == b, "": lambda a, b: a == b}
-    # "a || b": any alternative may match; within one alternative all terms
-    # must hold. Each term is an optional operator and a version of up to
-    # three parts, with an optional pre-release suffix (ignored).
     any_ok = False
     for alternative in constraint.split("||"):
         terms = re.findall(r"(>=|<=|>|<|=)?\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-[0-9A-Za-z.]+)?", alternative)
@@ -1006,12 +883,10 @@ def _satisfies(version: str, constraint: str) -> bool | None:
 
 
 HOSTNAME_RE = r"([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}"
-RESERVED_LISTENERS = {"argocd", "headlamp", "grafana"}   # https-<name> listeners of the script's own hosts
+RESERVED_LISTENERS = {"argocd", "headlamp", "grafana"}
 
 
 def _load_cert_manager(c: dict, base_dir: Path, lan: bool) -> CertManager:
-    """Validate the 'certManager' section. The certificates are proven with
-    HTTP-01 challenges on the ingress gateway, which only exists in LAN mode."""
     _check(lan, "'certManager' needs a 'lan' section (certificates are for the LAN ingress gateway)")
     _check(re.fullmatch(r"v\d+\.\d+\.\d+", c["chartVersion"]) is not None,
            "'certManager.chartVersion' must look like v1.21.2")
@@ -1024,11 +899,9 @@ def _load_cert_manager(c: dict, base_dir: Path, lan: bool) -> CertManager:
         _check(isinstance(host, str) and re.fullmatch(HOSTNAME_RE, host) is not None,
                f"'certManager.extraHosts': {host!r} must be a fully qualified host name")
         labels.append(host.split(".")[0])
-    # Listener names: https-<first label>, beside the script's own hosts.
     clash = sorted({x for x in labels if labels.count(x) > 1} | (set(labels) & RESERVED_LISTENERS))
     _check(not clash, f"'certManager.extraHosts': listener name(s) {', '.join(clash)} taken (first labels must "
                       f"be unique and not {', '.join(sorted(RESERVED_LISTENERS))})")
-    # The CA is a public certificate: relative to the cluster file.
     _check(re.fullmatch(LABEL_KEY_RE, c["listenersLabel"]) is not None,
            "'certManager.listenersLabel' must be a label key, e.g. deploy-talos/listeners or example.org/listeners")
     return CertManager(c["chartVersion"], c["acmeServer"], _resolve(c["caFile"], base_dir) if c["caFile"] else None,
@@ -1036,8 +909,6 @@ def _load_cert_manager(c: dict, base_dir: Path, lan: bool) -> CertManager:
 
 
 def _load_headlamp(h: dict, cert_manager: bool) -> Headlamp:
-    """Validate the 'headlamp' section. A host name means HTTPS on the ingress
-    gateway, so it needs certManager for the certificate."""
     _check(re.fullmatch(r"\d+\.\d+\.\d+", h["chartVersion"]) is not None,
            "'headlamp.chartVersion' must look like 0.45.0")
     if h["hostname"] is not None:
@@ -1048,8 +919,6 @@ def _load_headlamp(h: dict, cert_manager: bool) -> Headlamp:
 
 
 def _load_monitoring(m: dict, addons: bool, cert_manager: bool) -> Monitoring:
-    """Validate the 'monitoring' section. Like Headlamp's, a host name means
-    HTTPS on the ingress gateway, so it needs certManager."""
     _check(addons, "'monitoring' needs 'argocd.addons.enabled: true' (it is an add-on in the repository)")
     _check(re.fullmatch(r"\d+\.\d+\.\d+", m["chartVersion"]) is not None,
            "'monitoring.chartVersion' must look like 92.8.0")
@@ -1067,8 +936,6 @@ LONGHORN_EXTENSIONS = ["siderolabs/iscsi-tools", "siderolabs/util-linux-tools"]
 
 
 def _load_longhorn(lh: dict) -> Longhorn:
-    """Validate the 'longhorn' section. Replicas default to one per storage
-    node, at most 3."""
     _check(re.fullmatch(r"\d+\.\d+\.\d+", lh["chartVersion"]) is not None,
            "'longhorn.chartVersion' must look like 1.12.1")
     n = lh["nodes"]
@@ -1086,9 +953,6 @@ def _load_longhorn(lh: dict) -> Longhorn:
 
 def _load_oidc(o: dict, base_dir: Path, secret_base: Path, cluster: str, argocd: bool,
                headlamp: bool = False, grafana: bool = False, sops: bool = False) -> Oidc:
-    """Validate the 'oidc' section; client IDs default to k8s-<cluster>,
-    argocd-<cluster>, headlamp-<cluster> and grafana-<cluster>, so several
-    clusters can share one realm."""
     issuer = o["issuer"].rstrip("/")
     _check(re.fullmatch(r"https://[^/]+/.+", issuer) is not None, "'oidc.issuer' must be an https:// URL")
     k, a, hl, gf = o["kubernetes"], o["argocd"], o["headlamp"], o["grafana"]
@@ -1113,15 +977,12 @@ def _load_oidc(o: dict, base_dir: Path, secret_base: Path, cluster: str, argocd:
         _check(re.fullmatch(r"[A-Za-z0-9:._-]*", k[key]) is not None, f"'oidc.kubernetes.{key}' has invalid characters")
     cp = o["crossplane"]
     if cp["enabled"]:
-        # The objects and the clients' secrets (which Crossplane sets in
-        # Keycloak) live in the repository, SOPS-encrypted.
         _check(sops, "'oidc.crossplane.enabled' needs 'argocd.addons' with 'sopsAgeKeyFile' (the clients' "
                      "objects and secrets live in the repository)")
         _check("/realms/" in issuer, "with oidc.crossplane, 'oidc.issuer' must be a Keycloak realm URL")
 
     def file(v, base=base_dir):
         return _resolve(v, base) if v else None
-    # caFile is a public certificate: relative to the file. Credentials: secretsDir.
     return Oidc(issuer=issuer, ca_file=file(o["caFile"]), keycloak_admin_user=o["keycloakAdminUser"],
                 keycloak_admin_password_file=file(o["keycloakAdminPasswordFile"], secret_base),
                 k8s_client_id=k["clientId"] or f"k8s-{cluster}", username_prefix=k["usernamePrefix"],
@@ -1142,14 +1003,11 @@ def oidc_auth_patch(oidc: Oidc) -> str:
     """KubeAuthenticationConfig: Talos' default anonymous health endpoints plus
     the OIDC issuer. Talos replaces this document's 'configuration' as a whole,
     so the anonymous part must be repeated."""
-    # Tokens are accepted only if issued for one of the cluster's own clients
-    # (audience): kubectl's, and Headlamp's, which passes the user's token on.
     audiences = [oidc.k8s_client_id] + ([oidc.headlamp_client_id] if oidc.headlamp_client_id else [])
     issuer = {"url": oidc.issuer, "audiences": audiences}
     if len(audiences) > 1:
         issuer["audienceMatchPolicy"] = "MatchAny"   # required with several audiences
     if oidc.ca_file:
-        # Embedded as PEM: the API server must verify the issuer's certificate.
         issuer["certificateAuthority"] = oidc.ca_file.read_text()
     doc = {
         "apiVersion": "v1alpha1", "kind": "KubeAuthenticationConfig",
@@ -1168,12 +1026,10 @@ def oidc_auth_patch(oidc: Oidc) -> str:
 
 
 class KeycloakAdmin:
-    """Minimal Keycloak admin REST client (realm, groups, clients)."""
 
     def __init__(self, oidc: Oidc):
-        """Log in as the Keycloak admin (password grant of the master realm's
-        admin-cli client). The token is short-lived (one minute by default) and
-        never refreshed: each step creates its own KeycloakAdmin."""
+        """The token is short-lived (one minute by default) and never refreshed: each
+        step creates its own KeycloakAdmin."""
         import ssl
         self.oidc = oidc
         self.base = oidc.keycloak_url
@@ -1190,8 +1046,6 @@ class KeycloakAdmin:
 
     def _call(self, method: str, path: str, body=None, raw: bytes | None = None,
               ctype: str = "application/json", auth: bool = True, ok404: bool = False):
-        """One admin REST call. body is sent as JSON, raw as is; returns the
-        decoded JSON answer (None if empty, or on 404 with ok404)."""
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         headers = {"Content-Type": ctype, "User-Agent": PROG}
         if auth:
@@ -1224,7 +1078,6 @@ class KeycloakAdmin:
             self._call("POST", f"/admin/realms/{r}/groups", {"name": name})
 
     def ensure_client(self, rep: dict) -> str:
-        """Create or update an OIDC client with a 'groups' claim; returns its id."""
         r = self.oidc.realm
         cid = rep["clientId"]
         found = self._call("GET", f"/admin/realms/{r}/clients?clientId={urllib.parse.quote(cid)}") or []
@@ -1252,7 +1105,6 @@ class KeycloakAdmin:
         return uid
 
     def delete_client(self, client_id: str) -> bool:
-        """Delete a client by clientId; True if there was one."""
         r = self.oidc.realm
         found = self._call("GET", f"/admin/realms/{r}/clients?clientId={urllib.parse.quote(client_id)}", ok404=True) or []
         for c in found:
@@ -1260,7 +1112,6 @@ class KeycloakAdmin:
         return bool(found)
 
     def find_client(self, client_id: str) -> tuple[str | None, str | None]:
-        """(id, id of its 'groups' mapper) of a client by clientId; None for what doesn't exist."""
         r = self.oidc.realm
         found = self._call("GET", f"/admin/realms/{r}/clients?clientId={urllib.parse.quote(client_id)}") or []
         if not found:
@@ -1270,13 +1121,11 @@ class KeycloakAdmin:
         return uid, next((m["id"] for m in mappers if m["name"] == "groups"), None)
 
     def find_group(self, name: str) -> str | None:
-        """The id of a top-level group by exact name."""
         found = self._call("GET", f"/admin/realms/{self.oidc.realm}/groups?search={urllib.parse.quote(name)}"
                                   "&exact=true") or []
         return next((g["id"] for g in found if g["name"] == name), None)
 
     def client_secret(self, uid: str) -> str:
-        """Secret of a confidential client (Keycloak generates it at creation)."""
         return self._call("GET", f"/admin/realms/{self.oidc.realm}/clients/{uid}/client-secret")["value"]
 
 
@@ -1299,19 +1148,14 @@ def _cache_home() -> Path:
 
 
 def _resolve(p: str, base: Path) -> Path:
-    """Expand ~ and make p absolute, relative to base."""
     path = Path(p).expanduser()
     return path if path.is_absolute() else base / path
 
 
-# --------------------------------------------------------------------------
-# Inventory / address plan
-# --------------------------------------------------------------------------
-
 @dataclasses.dataclass
 class Node:
-    """One VM. Its addresses are a pure function of the cluster file and the
-    node's number (make_node), so they never need to be stored."""
+    """Its addresses are a pure function of the cluster file and the node's number
+    (make_node), so they never need to be stored."""
     name: str
     role: str          # controlplane | worker | storage (a Talos worker dedicated to Longhorn)
     ip: str
@@ -1321,23 +1165,18 @@ class Node:
 
 
 def make_node(cfg: Config, role: str, i: int) -> Node:
-    """Addresses of control plane / worker / storage node number i.
-
-    Internal plan: .1 gateway, .10 internal VIP, .11-.19 control planes,
-    .21-.90 workers, .91-.99 storage nodes. Storage nodes have no LAN NIC
-    (Longhorn traffic stays on the internal network). LAN plan: first address API VIP, then the control planes;
-    workers are taken from the top of the range downwards, so that scaling
-    workers only moves the upper bound of the LoadBalancer pool in between
-    (Cilium assigns pool addresses from the bottom). The MAC's 4th byte comes
-    from the cluster name so that two clusters never share MACs by accident."""
+    """Internal plan: .1 gateway, .10 internal VIP, .11-.19 control planes, .21-.90
+    workers, .91-.99 storage nodes. LAN plan: first address API VIP, then the
+    control planes; workers are taken from the top of the range downwards, so that
+    scaling workers only moves the upper bound of the LoadBalancer pool in between
+    (Cilium assigns pool addresses from the bottom). The MAC's 4th byte comes from
+    the cluster name so that two clusters never share MACs by accident."""
     tag = zlib.crc32(cfg.name.encode()) % 256
     cp = role == "controlplane"
     short, ip_base, mac_role = {"controlplane": ("cp", 10, 1), "worker": ("w", 20, 2),
                                 "storage": ("st", 90, 3)}[role]
     lan_ip = lan_mac = None
     if cfg.lan and role != "storage":
-        # Example, range .200-.229 with 3 control planes: VIP .200, cp-1..3
-        # .201-.203, w-1 .229, w-2 .228, ...
         lan_ip = None if cfg.lan.dhcp else f"{cfg.lan.base}.{cfg.lan.first + i if cp else cfg.lan.last - (i - 1)}"
         # MAC layout 52:54:00 (libvirt's prefix):<cluster tag>:<role>:<number>;
         # the LAN NIC's role byte has 0x10 added to stay distinct.
@@ -1356,19 +1195,15 @@ def nodes(cfg: Config) -> list[Node]:
 
 
 def node_group(cfg: Config, node: Node) -> NodeGroup:
-    """Size of a node (its group in the cluster file)."""
     return {"controlplane": cfg.control_planes, "worker": cfg.workers}.get(node.role) or cfg.longhorn.nodes
 
 
 def node_files(cfg: Config, name: str, role: str) -> list[Path]:
-    """A node's files on the host: its disk, its config ISO and, for a
-    storage node, its data disk, in its role's images directory."""
     d = cfg.images_dirs[role]
     return [d / f"{name}.qcow2", d / f"{name}-cidata.iso"] + ([d / f"{name}-data.qcow2"] if role == "storage" else [])
 
 
 def talos_role(node: Node) -> str:
-    """Talos machine type of a node: storage nodes are Talos workers."""
     return "controlplane" if node.role == "controlplane" else "worker"
 
 
@@ -1377,30 +1212,22 @@ def cp_ips(cfg: Config) -> list[str]:
 
 
 def worker_ips(cfg: Config) -> list[str]:
-    """Talos workers: workers and storage nodes."""
     return [n.ip for n in nodes(cfg) if n.role != "controlplane"]
 
 
 def lan_vip(cfg: Config) -> str:
-    """The Kubernetes API's address on the LAN: the first address of lan.range."""
     return f"{cfg.lan.base}.{cfg.lan.first}"
 
 
 def lan_pool(cfg: Config, workers: int | None = None) -> tuple[str, str]:
-    """LoadBalancer pool: between the control planes and the workers; with
-    DHCP addressing, the whole range after the VIP."""
     if cfg.lan.dhcp:
         return f"{cfg.lan.base}.{cfg.lan.first + 1}", f"{cfg.lan.base}.{cfg.lan.last}"
     workers = cfg.workers.count if workers is None else workers
-    # Skip the VIP and the control planes; stop below the lowest worker.
     start = cfg.lan.first + cfg.control_planes.count + 1
     return f"{cfg.lan.base}.{start}", f"{cfg.lan.base}.{cfg.lan.last - workers}"
 
 
 def api_endpoint(cfg: Config) -> str:
-    """Address clients use for the Kubernetes API: the LAN VIP in LAN mode,
-    else the internal VIP (.10) with several control planes, else the single
-    control plane itself."""
     if cfg.lan:
         return lan_vip(cfg)
     if cfg.control_planes.count > 1:
@@ -1408,18 +1235,11 @@ def api_endpoint(cfg: Config) -> str:
     return cp_ips(cfg)[0]
 
 
-# --------------------------------------------------------------------------
-# Helpers: processes, downloads
-# --------------------------------------------------------------------------
-
 def run(args: list[str], *, input: str | None = None, capture: bool = True,
         check: bool = True, env: dict | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
-    """Run a command. capture=True collects stdout and stderr together (for
-    error messages and parsing); False lets the output through to the
-    terminal. env adds to the current environment. With check, a non-zero
-    exit raises DeployError including the captured output. Error messages
-    show only the first words of the command, never its full arguments."""
-    full_env = {**os.environ, **env} if env else None   # None: inherit unchanged
+    """Error messages show only the first words of the command, never its full
+    arguments."""
+    full_env = {**os.environ, **env} if env else None
     try:
         proc = subprocess.run(args, input=input, text=True, env=full_env, timeout=timeout,
                               stdout=subprocess.PIPE if capture else None,
@@ -1435,12 +1255,10 @@ def run(args: list[str], *, input: str | None = None, capture: bool = True,
 
 
 def ok(args: list[str]) -> bool:
-    """True if the command succeeds (output discarded)."""
     return run(args, check=False).returncode == 0
 
 
 def answering(addrs: list[str]) -> list[str]:
-    """The addresses among addrs that answer a ping."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
         return [a for a, up in zip(addrs, pool.map(lambda a: ok(["ping", "-c1", "-W1", a]), addrs)) if up]
 
@@ -1451,7 +1269,6 @@ NET_MARKER_NS = "urn:deploy-talos"
 
 
 def http_get(url: str, *, data: bytes | None = None) -> bytes:
-    """Small GET (or POST with data) returning the body, e.g. checksum files."""
     req = urllib.request.Request(url, data=data, headers={"User-Agent": PROG})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -1461,7 +1278,6 @@ def http_get(url: str, *, data: bytes | None = None) -> bytes:
 
 
 def download(url: str, dest: Path, sha256: str | None = None) -> None:
-    """Stream url to dest via a .part file; verify sha256 when given."""
     part = dest.with_name(dest.name + ".part")
     h = hashlib.sha256()
     req = urllib.request.Request(url, headers={"User-Agent": PROG})
@@ -1480,10 +1296,6 @@ def download(url: str, dest: Path, sha256: str | None = None) -> None:
     # download never looks like a cached tool.
     part.rename(dest)
 
-
-# --------------------------------------------------------------------------
-# Deployment
-# --------------------------------------------------------------------------
 
 class _BlockDumper(yaml.SafeDumper):
     """YAML dumper writing multi-line strings (PEM, known_hosts, embedded
@@ -1506,10 +1318,9 @@ def yaml_dump(obj) -> str:
 
 
 class Deployer:
-    """Carries out the commands for one cluster file. Tools run from the cache
-    directory (fetch_* download them on first use), and talosctl/kubectl
-    always get the cluster's own talosconfig/kubeconfig explicitly, so the
-    user's environment (TALOSCONFIG, KUBECONFIG, ~/.kube) is never used."""
+    """talosctl/kubectl always get the cluster's own talosconfig/kubeconfig
+    explicitly, so the user's environment (TALOSCONFIG, KUBECONFIG, ~/.kube) is
+    never used."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1517,16 +1328,14 @@ class Deployer:
         self.kubectl_bin = cfg.cache_dir / "kubectl"
         self.helm_bin = cfg.cache_dir / "helm"
         self.sops_bin = cfg.cache_dir / f"sops-{SOPS_VERSION}"
-        self.git_secrets: dict[str, dict] = {}   # SOPS mode: Secrets to publish, by file name
-        self._secrets_in_git: dict[str, dict] | None = None   # SOPS mode: those already in Git, decrypted
-        self._keycloak_ids: dict | None = None    # oidc.crossplane: ids of existing Keycloak objects
-        self.kept_in_git: dict[str, str] = {}    # content 'reuse': generated files found in Git, kept as they are
+        self.git_secrets: dict[str, dict] = {}
+        self._secrets_in_git: dict[str, dict] | None = None
+        self._keycloak_ids: dict | None = None
+        self.kept_in_git: dict[str, str] = {}
         self.talosconfig = cfg.cluster_dir / "talosconfig"
         self.kubeconfig = cfg.cluster_dir / "kubeconfig"
         self.schematic_id = ""            # set by resolve_schematic()
         self.image: Path | None = None    # set by fetch_image()
-
-    # -- tool wrappers -----------------------------------------------------
 
     def virsh(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return run(["virsh", "-c", self.cfg.libvirt_uri, *args], check=check)
@@ -1541,18 +1350,12 @@ class Deployer:
                    input=input, check=check, capture=capture)
 
     def helm(self, *args: str) -> subprocess.CompletedProcess:
-        # Keep helm's config, cache and data out of the user's home.
         home = self.cfg.cache_dir / "helm-home"
         env = {"HELM_CONFIG_HOME": str(home / "config"), "HELM_CACHE_HOME": str(home / "cache"),
                "HELM_DATA_HOME": str(home / "data")}
         return run([str(self.helm_bin), "--kubeconfig", str(self.kubeconfig), *args], env=env)
 
-    # -- checks --------------------------------------------------------------
-
     def preflight(self) -> None:
-        """Read-only host checks before create (also run by 'plan'): tools, KVM,
-        no leftovers with the cluster's names, free addresses, and reachable
-        Git repository / Keycloak when those sections are present."""
         cfg = self.cfg
         for tool in ("virsh", "virt-install", "qemu-img", "xorriso", "ip", "ping"):
             if not shutil.which(tool):
@@ -1563,8 +1366,6 @@ class Deployer:
             self.preflight_existing_bridge()
         else:
             self.preflight_created_network()
-        # Leftovers of an earlier cluster with the same name would be
-        # overwritten or clash: refuse instead (destroy removes them).
         for n in nodes(cfg):
             if self.virsh("dominfo", n.name, check=False).returncode == 0:
                 raise DeployError(f"domain '{n.name}' already exists")
@@ -1579,7 +1380,6 @@ class Deployer:
             self.check_oidc()
 
     def preflight_created_network(self) -> None:
-        """The libvirt network, its bridge and its subnet must all be free."""
         cfg = self.cfg
         if self.virsh("net-info", cfg.network, check=False).returncode == 0:
             raise DeployError(f"libvirt network '{cfg.network}' already exists (set network.name to another name)")
@@ -1593,15 +1393,10 @@ class Deployer:
             raise DeployError(f"{cfg.net_prefix}.0/24 is already routed on this host (choose another network.prefix)")
 
     def preflight_existing_bridge(self) -> None:
-        """The bridge exists, the host can reach the private subnet through it,
-        and no machine already answers on the nodes' addresses."""
         cfg = self.cfg
         br = cfg.existing_bridge
         if not Path(f"/sys/class/net/{br}/bridge").is_dir():
             raise DeployError(f"'{br}' is not a bridge on this host (network.existingBridge)")
-        # talosctl (and kubectl without LAN mode) talk to the nodes from here.
-        # Ask the kernel which interface it would use for the first control
-        # plane's address: it must be the bridge itself.
         probe = f"{cfg.net_prefix}.11"
         route = run(["ip", "-4", "route", "get", probe], check=False).stdout
         if f" dev {br} " not in route:
@@ -1616,8 +1411,8 @@ class Deployer:
             raise DeployError(f"node addresses already in use on {br}: {' '.join(used)}")
 
     def preflight_lan(self) -> None:
-        """No address of lan.range may answer a ping. This only detects hosts
-        that are up, so the range must also be outside the router's DHCP pool."""
+        """This only detects hosts that are up, so the range must also be outside the
+        router's DHCP pool."""
         lan = self.cfg.lan
         self.resolve_lan()
         log(f"Checking that {lan.range} is unused on the LAN")
@@ -1626,7 +1421,6 @@ class Deployer:
             raise DeployError(f"addresses in lan.range already in use: {' '.join(answered)}")
 
     def resolve_lan(self) -> None:
-        """Fill in the LAN gateway / prefix length from the host if not set."""
         lan = self.cfg.lan
         if not Path(f"/sys/class/net/{lan.bridge}/bridge").is_dir():
             raise DeployError(f"'{lan.bridge}' is not a bridge on this host")
@@ -1640,25 +1434,19 @@ class Deployer:
             if not m:
                 raise DeployError(f"no IPv4 address on {lan.bridge}; set lan.prefixLength")
             lan.prefix_length = int(m.group(1))
-        # The LAN subnet, from the gateway and prefix length; both ends of the
-        # range must be inside it (the range is contiguous, so all of it is).
         net = ipaddress.IPv4Network(f"{lan.gateway}/{lan.prefix_length}", strict=False)
         for octet in (lan.first, lan.last):
             if ipaddress.IPv4Address(f"{lan.base}.{octet}") not in net:
                 raise DeployError(f"lan.range is not inside the LAN subnet {net}")
 
-    # -- downloads ------------------------------------------------------------
-
     def fetch_talosctl(self) -> None:
-        """talosctl of talos.version, verified against the release's sha256sum.txt.
-        The default cache directory is per Talos version, so it always matches."""
+        """The default cache directory is per Talos version, so it always matches."""
         cfg = self.cfg
         cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         if self.talosctl_bin.exists():
             return
         log(f"Downloading talosctl {cfg.talos_version}")
         base = f"https://github.com/siderolabs/talos/releases/download/{cfg.talos_version}"
-        # The release's checksum file lists every asset: pick talosctl's line.
         sums = http_get(f"{base}/sha256sum.txt").decode()
         m = re.search(r"^([0-9a-f]{64})\s+talosctl-linux-amd64$", sums, re.M)
         if not m:
@@ -1667,9 +1455,6 @@ class Deployer:
         self.talosctl_bin.chmod(0o755)
 
     def fetch_kubectl(self) -> None:
-        """kubectl matching the Kubernetes version in the generated configs."""
-        # The API server image tag in the generated config is the cluster's
-        # Kubernetes version (talos.kubernetesVersion or the release default).
         m = re.search(r"kube-apiserver:(v[0-9.]+)", (self.cfg.cluster_dir / "controlplane.yaml").read_text())
         if not m:
             raise DeployError("could not determine the Kubernetes version from controlplane.yaml")
@@ -1689,8 +1474,6 @@ class Deployer:
         self.kubectl_bin.chmod(0o755)
 
     def fetch_helm(self) -> None:
-        """helm of helm.version, verified against its .sha256sum file; replaced
-        when the cached binary reports another version."""
         version = self.cfg.helm_version
         if self.helm_bin.exists():
             out = run([str(self.helm_bin), "version", "--template", "{{.Version}}"], check=False).stdout.strip()
@@ -1712,7 +1495,6 @@ class Deployer:
         self.helm_bin.chmod(0o755)
 
     def fetch_sops(self) -> None:
-        """sops (SOPS_VERSION), verified against the release's checksums file."""
         if self.sops_bin.exists():
             return
         log(f"Downloading sops {SOPS_VERSION}")
@@ -1731,8 +1513,6 @@ class Deployer:
         """Register the schematic with the Image Factory (idempotent: the ID is a
         hash of the content)."""
         log("Resolving Image Factory schematic")
-        # The schematic lists the system extensions to bake into the image; the
-        # factory answers with its ID, which names the image and the installer.
         schematic = yaml.safe_dump({"customization": {"systemExtensions": {"officialExtensions": self.cfg.extensions}}})
         try:
             self.schematic_id = json.loads(http_get(f"{FACTORY_URL}/schematics", data=schematic.encode()))["id"]
@@ -1740,16 +1520,13 @@ class Deployer:
             raise DeployError("Image Factory did not return a schematic ID") from e
 
     def installer_image(self) -> str:
-        """Installer image for this schematic and Talos version; Talos installs
-        and upgrades itself from it. A container image reference: registry
-        host without the URL scheme."""
+        """A container image reference: registry host without the URL scheme."""
         registry = FACTORY_URL.removeprefix("https://")
         return f"{registry}/nocloud-installer/{self.schematic_id}:{self.cfg.talos_version}"
 
     def fetch_image(self) -> None:
-        """Resolve the schematic and download the matching nocloud disk image.
-        The factory publishes no checksums for generated images; integrity
-        relies on HTTPS."""
+        """The factory publishes no checksums for generated images; integrity relies
+        on HTTPS."""
         cfg = self.cfg
         self.resolve_schematic()
         self.image = cfg.cache_dir / f"nocloud-amd64-{self.schematic_id}.qcow2"
@@ -1763,14 +1540,9 @@ class Deployer:
             self.image.unlink()
             raise DeployError("downloaded image is not a qcow2")
 
-    # -- machine configs -------------------------------------------------------
-
     def patches(self) -> tuple[str, str | None]:
-        """Patches for all nodes, and for control planes only (or None)."""
         cfg = self.cfg
         internal = f"{cfg.net_prefix}.0/24"
-        # Every node: install from the factory's installer (with the
-        # extensions) onto the VM's virtio disk.
         common = textwrap.dedent(f"""\
             apiVersion: v1alpha1
             kind: UnattendedInstallConfig
@@ -1780,12 +1552,9 @@ class Deployer:
                 diskSelector:
                     match: disk.dev_path == "/dev/vda"
             """)
-        # No DHCP on an existing bridge, hence no DNS servers unless given here.
         if cfg.existing_bridge and cfg.nameservers:
             servers = "\n".join(f"    - address: {ns}" for ns in cfg.nameservers)
             common += f"---\napiVersion: v1alpha1\nkind: ResolverConfig\nnameservers:\n{servers}\n"
-        # Internal-only cluster: flannel and kube-proxy stay (Talos defaults);
-        # with several control planes they share the internal VIP .10.
         if not cfg.lan:
             cp = None if cfg.control_planes.count == 1 else textwrap.dedent(f"""\
                 apiVersion: v1alpha1
@@ -1797,7 +1566,6 @@ class Deployer:
                 cp = (cp + "---\n" if cp else "") + oidc_auth_patch(cfg.oidc)
             return common, cp
 
-        # LAN mode from here on.
         if not cfg.existing_bridge:
             common += textwrap.dedent(f"""\
                 ---
@@ -1851,12 +1619,10 @@ class Deployer:
         return common, controlplane
 
     def firewall_rules(self) -> str:
-        """LAN mode: the node services' ingress rules (NetworkRuleConfig).
-        Each port is in exactly one rule: a rule drops what doesn't come from
-        its own subnets, so two rules on one port would admit nothing. The
-        Talos API also admits the pod network when controllers drive it from
-        pods (talos_api_access): a pod reaching its own node keeps its pod
-        address."""
+        """Each port is in exactly one rule: a rule drops what doesn't come from its
+        own subnets, so two rules on one port would admit nothing. The Talos API
+        also admits the pod network when controllers drive it from pods
+        (talos_api_access): a pod reaching its own node keeps its pod address."""
         internal = f"{self.cfg.net_prefix}.0/24"
         api_from = [internal] + ([POD_SUBNET] if self.cfg.tuppr or self.cfg.talos_backup else [])
         # The kubelet API (it authenticates and authorizes every request)
@@ -1892,8 +1658,6 @@ class Deployer:
             """) + "".join(f"    - subnet: {net}\n" for net in api_from)
 
     def node_patch(self, node: Node) -> str:
-        """Per-node part of the machine config: host name, and the static
-        addresses and routes (existing bridge, LAN NIC)."""
         patch = textwrap.dedent(f"""\
             apiVersion: v1alpha1
             kind: HostnameConfig
@@ -1901,8 +1665,7 @@ class Deployer:
             hostname: {node.name}
             """)
         if self.cfg.existing_bridge:
-            # No DHCP on an existing bridge: static internal address. Its
-            # default route (if any) loses to the LAN one (metric 100).
+            # Its default route (if any) loses to the LAN one (metric 100).
             route = textwrap.dedent(f"""\
                 routes:
                     - gateway: {self.cfg.net_gateway}
@@ -1958,8 +1721,6 @@ class Deployer:
         return patch
 
     def trusted_roots_docs(self) -> list[dict]:
-        """omni section with a caFile: the nodes trust Omni's CA (they join
-        Omni's SideroLink API over HTTPS)."""
         o = self.cfg.omni
         if not o or not o.ca_file:
             return []
@@ -1985,11 +1746,8 @@ class Deployer:
         return docs
 
     def talos_api_access(self) -> str | None:
-        """KubeTalosAPIAccessConfig for the controllers that drive the Talos
-        API from pods: tuppr (os:admin in its namespace), talos-backup
-        (os:etcd:backup in its). None without them. Each namespace may only
-        request the roles its Talos ServiceAccount asks for, but the document
-        allows every listed role in every listed namespace.
+        """Each namespace may only request the roles its Talos ServiceAccount asks
+        for, but the document allows every listed role in every listed namespace.
         Control planes only: they issue the pods' Talos API credentials (Talos
         rejects the document on workers)."""
         roles, namespaces = [], []
@@ -2009,10 +1767,6 @@ class Deployer:
             """)
 
     def apply_node_config(self) -> None:
-        """Bring the running nodes in line with the cluster file's live node
-        settings, without a reboot: Talos API access (the access document on
-        the control planes, the firewall rules on every node in LAN mode) and
-        the registry mirrors. Only nodes whose documents differ are patched."""
         access = self.talos_api_access()
         rules = [d for d in yaml.safe_load_all(self.firewall_rules()) if d] if self.cfg.lan and access else []
         registry = self.registry_docs() + self.trusted_roots_docs()
@@ -2031,7 +1785,6 @@ class Deployer:
             changed = [w for w in wants if not any(h == w for h in haves)]
             # Clusters made by earlier versions: one rule held all node ports.
             stale = [h for h in haves if key(h) == ("NetworkRuleConfig", "internal-only")]
-            # Mirrors of upstreams removed from registry.registries.
             stale += [h for h in haves if mirror and h.get("kind") == "RegistryMirrorConfig"
                       and h.get("name") not in self.cfg.registry.registries
                       and any(e.get("url", "").startswith(mirror + "/") for e in h.get("endpoints", []))]
@@ -2048,7 +1801,6 @@ class Deployer:
             log(f"{n.name}: updated {', '.join(what)}")
 
     def node_config(self) -> None:
-        """The 'node-config' command."""
         for f in (self.kubeconfig, self.talosconfig):
             if not f.exists():
                 raise DeployError(f"{f} not found; was this cluster created from {self.cfg.source}?")
@@ -2056,10 +1808,7 @@ class Deployer:
         self.apply_node_config()
         log("Node settings match the cluster file")
 
-    # -- Omni ----------------------------------------------------------------
-
     def fetch_omnictl(self) -> Path:
-        """omnictl of omni.omnictlVersion (the Omni server's version), checksum-verified."""
         v = self.cfg.omni.omnictl_version
         binary = self.cfg.cache_dir / f"omnictl-{v}"
         if binary.exists():
@@ -2099,8 +1848,6 @@ class Deployer:
         return p
 
     def omni_import(self, dry_run: bool = False, abort: bool = False) -> None:
-        """The 'omni' command: import the cluster into Omni (locked), or abort
-        an import. Idempotent: a cluster already in Omni is only reported."""
         if not self.cfg.omni:
             raise DeployError(f"{self.cfg.source} has no 'omni' section")
         for f in (self.kubeconfig, self.talosconfig):
@@ -2183,10 +1930,6 @@ class Deployer:
             """)
 
     def generate_configs(self) -> None:
-        """Write the cluster directory: secrets.yaml (generated once, reused on
-        re-runs so the cluster keeps its identity), the patches, the role
-        configs (controlplane.yaml, worker.yaml), one validated config per node
-        under nodes/, and talosconfig pointing at the control planes."""
         cfg = self.cfg
         (cfg.cluster_dir / "nodes").mkdir(parents=True, exist_ok=True)
         cfg.cluster_dir.chmod(0o700)
@@ -2197,8 +1940,6 @@ class Deployer:
             log("Generating cluster secrets")
             run([str(self.talosctl_bin), "gen", "secrets", "-o", str(secrets)])
 
-        # Patches go through files (talosctl reads @file); they are kept in the
-        # cluster directory as a record of what was applied.
         common, controlplane = self.patches()
         (cfg.cluster_dir / "patch-all.yaml").write_text(common)
         args = ["--config-patch", f"@{cfg.cluster_dir / 'patch-all.yaml'}"]
@@ -2227,8 +1968,6 @@ class Deployer:
             patch_file.unlink()
             run([str(self.talosctl_bin), "validate", "--mode", "cloud", "--strict", "-c", str(out)])
 
-        # talosctl talks to the control planes directly (any of them as
-        # endpoint) and targets the first one unless told otherwise.
         self.talosctl("config", "endpoint", *cp_ips(cfg))
         self.talosctl("config", "node", cp_ips(cfg)[0])
         self.protect_cluster_dir()
@@ -2241,16 +1980,10 @@ class Deployer:
         for f in d.rglob("*"):
             f.chmod(0o700 if f.is_dir() else 0o600)
 
-    # -- libvirt -------------------------------------------------------------
-
     def create_network(self) -> None:
-        """Define, start and autostart the cluster's libvirt NAT network, with a
-        DHCP reservation per node (so nodes get their planned addresses) and the
-        ownership marker destroy checks for."""
         cfg = self.cfg
         log(f"Creating libvirt network {cfg.network} ({cfg.net_prefix}.0/24)")
-        # One DHCP reservation per node (MAC -> planned address). The dynamic
-        # range .100-.199 stays clear of the node addresses (.11-.99).
+        # The dynamic range .100-.199 stays clear of the node addresses (.11-.99).
         hosts = "\n".join(f"      <host mac='{n.mac}' name='{n.name}' ip='{n.ip}'/>" for n in nodes(cfg))
         bridge = f"\n              <bridge name='{cfg.net_bridge_name}'/>" if cfg.net_bridge_name else ""
         xml = textwrap.dedent(f"""\
@@ -2273,10 +2006,6 @@ class Deployer:
         self.virsh("net-autostart", cfg.network)
 
     def create_node(self, node: Node) -> None:
-        """Create, start and autostart one VM: a copy of the Talos image as its
-        disk, and a cloud-init "nocloud" ISO (volume label cidata) whose
-        user-data is the node's machine config, which Talos applies on first
-        boot. Autostart brings the node back up when the host reboots."""
         cfg = self.cfg
         group = node_group(cfg, node)
         disk, iso = node_files(cfg, node.name, node.role)[:2]
@@ -2292,7 +2021,6 @@ class Deployer:
             shutil.copyfile(self.image, disk)
         finally:
             os.umask(old_umask)
-        # The image is small; grow the copy (thin) to the configured size.
         run(["qemu-img", "resize", "-q", str(disk), group.disk_size])
         # discard=unmap: the blocks Talos trims (its default FilesystemTrimConfig:
         # every volume, weekly) are freed in the thin qcow2 too, which otherwise
@@ -2326,12 +2054,8 @@ class Deployer:
              "--channel", "unix,target.type=virtio,target.name=org.qemu.guest_agent.0",
              "--graphics", "none", "--noautoconsole", "--autostart"])
 
-    # -- cluster bring-up ----------------------------------------------------
-
     @staticmethod
     def wait_for(what: str, probe, attempts: int, delay: float) -> None:
-        """Call probe() until it returns true, up to attempts times, delay
-        seconds apart; a DeployError from probe counts as "not yet"."""
         for _ in range(attempts):
             try:
                 if probe():
@@ -2342,9 +2066,6 @@ class Deployer:
         raise DeployError(f"timed out waiting for {what}")
 
     def bootstrap(self) -> None:
-        """Start etcd on the first control plane (once per cluster), fetch the
-        admin kubeconfig, install Cilium in LAN mode, then wait until the
-        whole cluster is healthy."""
         cfg = self.cfg
         cp1 = cp_ips(cfg)[0]
         log(f"Waiting for the Talos API on {cp1}")
@@ -2363,7 +2084,6 @@ class Deployer:
         else:
             raise DeployError(f"bootstrap failed: {last}")
 
-        # Admin kubeconfig, valid as soon as the API server answers.
         self.talosctl("-n", cp1, "kubeconfig", str(self.kubeconfig), "--force")
         self.kubeconfig.chmod(0o600)
 
@@ -2379,7 +2099,6 @@ class Deployer:
         self.verify_ready()
 
     def verify_ready(self) -> None:
-        """All nodes Ready and CoreDNS rolled out."""
         # With a CNI Talos doesn't manage (Cilium), `talosctl health` skips its
         # node-Ready and CoreDNS checks, so check both directly.
         log("Checking that all nodes are Ready and CoreDNS is available")
@@ -2387,7 +2106,6 @@ class Deployer:
         self.kubectl("-n", "kube-system", "rollout", "status", "deployment/coredns", "--timeout=10m")
 
     def gateway_api_url(self) -> str:
-        """The Gateway API release manifest (standard channel CRDs)."""
         return ("https://github.com/kubernetes-sigs/gateway-api/releases/download/"
                 f"{self.cfg.gateway_api_version}/standard-install.yaml")
 
@@ -2409,9 +2127,7 @@ class Deployer:
                          "--version", cfg.cilium_version, "--namespace", "kube-system",
                          "--wait", "--timeout", "15m", values=self.cilium_values())
 
-        # Addresses for LoadBalancer services, answered by ARP on the LAN NIC
-        # only (never on the internal network). The CRDs come with Cilium:
-        # wait until the API serves them.
+        # The CRDs come with Cilium: wait until the API serves them.
         start, end = lan_pool(cfg)
         log(f"Configuring LoadBalancer pool {start}-{end} on {LAN_LINK}")
         self.kubectl("wait", "--for", "condition=established", "--timeout", "120s",
@@ -2457,9 +2173,8 @@ class Deployer:
         }
 
     def apply_l2_policy(self) -> None:
-        """Announce LoadBalancer IPs by ARP on the LAN NIC. Only nodes with a
-        LAN NIC may hold an announcement: storage nodes are excluded, an
-        address announced by one of them would be unreachable."""
+        """Only nodes with a LAN NIC may hold an announcement: storage nodes are
+        excluded, an address announced by one of them would be unreachable."""
         key = STORAGE_TAINT.split("=")[0]
         self.kubectl("apply", "-f", "-", input=textwrap.dedent(f"""\
             apiVersion: cilium.io/v2alpha1
@@ -2482,25 +2197,11 @@ class Deployer:
     INGRESS_GW = "ingress"
 
     def apply_ingress_gateway(self, https_hosts: dict[str, str] | None = None, build_only: bool = False):
-        """Shared ingress Gateway (one LoadBalancer address for the cluster):
-        plain HTTP on :80 and TLS passthrough on :443, accepting routes from all
-        namespaces. Services are exposed through HTTPRoutes (port 80) and
-        TLSRoutes (443, the backend terminates TLS) by host name.
+        """With a certManager section: Cilium can't mix passthrough and termination
+        on one port, so there is no passthrough listener then.
 
-        With a certManager section, port 443 terminates TLS instead: one HTTPS
-        listener per host in https_hosts ({listener suffix: host name}), with
-        the host's certificate (Secret tls-<host>); routes attach to it as
-        https-<suffix>. Cilium can't mix passthrough and termination on one
-        port, so there is no passthrough listener then.
-
-        Also with certManager, namespaces labelled
-        <certManager.listenersLabel>=ingress may add HTTPS listeners of
-        their own through ListenerSets (Gateway API v1.5+), each with its
-        certificate in that namespace: a team's services get their host names
-        without changing this Gateway. Labelling a namespace is the platform's
-        decision (it lets that namespace claim any free host name).
-
-        build_only: return the objects (Namespace, Gateway) instead."""
+        Labelling a namespace is the platform's decision (it lets that namespace
+        claim any free host name)."""
         listeners = [
             {"name": "http", "protocol": "HTTP", "port": 80, "allowedRoutes": {"namespaces": {"from": "All"}}},
         ]
@@ -2527,7 +2228,6 @@ class Deployer:
         self.wait_gateway(https_hosts)
 
     def wait_gateway(self, https_hosts: dict[str, str] | None = None) -> None:
-        """Wait until the ingress gateway and every listener are programmed."""
         self.kubectl("-n", self.INGRESS_NS, "wait", "--for=condition=Programmed", f"gateway/{self.INGRESS_GW}",
                      "--timeout=3m")
         # The gateway can be Programmed while single listeners are not (e.g. a
@@ -2543,7 +2243,6 @@ class Deployer:
             f"(HTTP :80{', ' + port443 + ' :443' if port443 else ''})")
 
     def unprogrammed_listeners(self) -> list[str]:
-        """Gateway listeners that are not Programmed, with the reason."""
         p = self.kubectl("-n", self.INGRESS_NS, "get", "gateway", self.INGRESS_GW, "-o", "json", check=False)
         if p.returncode != 0:
             return ["gateway not readable"]
@@ -2558,8 +2257,6 @@ class Deployer:
         return bad
 
     def https_hosts(self) -> dict[str, str]:
-        """Host names that get an HTTPS listener on the gateway (certManager
-        only): {listener suffix: host}."""
         cfg = self.cfg
         hosts = {}
         if cfg.cert_manager and cfg.argocd and cfg.argocd.hostname:
@@ -2582,14 +2279,11 @@ class Deployer:
         self.apply_ingress_gateway(hosts)
 
     def apply_https_routes(self, ns: str, name: str, host: str, service: str, port: int) -> None:
-        """HTTPRoutes for a host on the HTTPS listener https-<name>: to the
-        service, and http://<host> redirected to https. ACME challenges for the
-        host still work over HTTP: their exact-path routes take precedence over
-        the redirect."""
+        """ACME challenges for the host still work over HTTP: their exact-path routes
+        take precedence over the redirect."""
         self.apply_objects(*self.https_routes(ns, name, host, service, port))
 
     def https_routes(self, ns: str, name: str, host: str, service: str, port: int) -> list[dict]:
-        """The two HTTPRoutes of apply_https_routes."""
         gw = {"name": self.INGRESS_GW, "namespace": self.INGRESS_NS}
         return [
             {"apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
@@ -2604,11 +2298,9 @@ class Deployer:
 
     @staticmethod
     def tls_secret(host: str) -> str:
-        """Name of the Secret holding a host's certificate (in the gateway's namespace)."""
         return "tls-" + host.replace(".", "-")
 
     def ingress_gateway_ip(self) -> str:
-        """The gateway's LoadBalancer address, or "" (no address yet, or the API is unreachable)."""
         p = self.kubectl("-n", self.INGRESS_NS, "get", "gateway", self.INGRESS_GW, "--request-timeout=15s",
                          "-o", "jsonpath={.status.addresses[0].value}", check=False)
         out = p.stdout.strip()
@@ -2616,16 +2308,11 @@ class Deployer:
 
 
     def dns_records(self, domain: str) -> list[dict]:
-        """LAN DNS records for the cluster: api.<name>.<domain> -> API VIP,
-        *.apps.<name>.<domain> (and argocd.hostname) -> the ingress gateway's
-        LoadBalancer address, read from the running cluster."""
         cfg = self.cfg
         if not cfg.lan:
             raise DeployError("the cluster has no 'lan' section: its addresses are private to this host, "
                               "there is nothing to register in a LAN DNS")
         zone = f"{cfg.name}.{domain}"
-        # The API VIP is known from the file; the gateway's address is handed
-        # out by Cilium at run time, so it is read from the cluster.
         records = [{"name": f"api.{zone}", "type": "A", "address": lan_vip(cfg)}]
         if not self.kubeconfig.exists():
             raise DeployError(f"{self.kubeconfig} not found; create the cluster first")
@@ -2635,20 +2322,13 @@ class Deployer:
             raise DeployError(f"the ingress gateway {self.INGRESS_NS}/{self.INGRESS_GW} has no address "
                               "(is the cluster running?)")
         records.append({"name": f"*.apps.{zone}", "type": "A", "address": gw})
-        # argocd.hostname, headlamp.hostname and monitoring.hostname need
-        # their own record only outside the wildcard.
         for host in (cfg.argocd.hostname if cfg.argocd else None, cfg.headlamp.hostname if cfg.headlamp else None,
                      cfg.monitoring.hostname if cfg.monitoring else None):
             if host and not host.endswith(f".apps.{zone}"):
                 records.append({"name": host, "type": "A", "address": gw})
         return records
 
-    # -- Argo CD -------------------------------------------------------------
-
     def read_secret(self, file: Path, what: str) -> str:
-        """Content of a credential file, stripped. Credentials only ever come
-        from files named in the cluster file; an empty file is an error, so a
-        forgotten secret never becomes an empty password."""
         try:
             value = file.read_text().strip()
         except OSError as e:
@@ -2658,7 +2338,6 @@ class Deployer:
         return value
 
     def repo_credentials(self) -> dict[str, str]:
-        """Fields of the Argo CD repository secret (credentials included)."""
         r = self.cfg.argocd.repo
         fields = {"type": "git", "url": r.url}
         if r.method == "ssh":
@@ -2677,8 +2356,6 @@ class Deployer:
         return fields
 
     def known_hosts(self) -> str | None:
-        """known_hosts lines for an SSH repository (None: not SSH or insecure).
-        'auto' scans the server's host keys from this host (trust on first use)."""
         r = self.cfg.argocd.repo
         if r.method != "ssh" or r.known_hosts == "insecure":
             return None
@@ -2692,7 +2369,6 @@ class Deployer:
             lines = [l for l in out.splitlines() if l and not l.startswith("#")]
             if not lines:
                 raise DeployError(f"could not read SSH host keys from {host}:{port} (knownHosts: auto)")
-            # Print the fingerprints so they can be compared with the server's.
             fps = run(["ssh-keygen", "-l", "-f", "-"], input="\n".join(lines) + "\n", check=False).stdout
             log(f"Trusting SSH host keys of {host}:{port}:")
             for fp in fps.splitlines():
@@ -2707,16 +2383,13 @@ class Deployer:
 
     def git_env(self, tmp: Path, ssh_key: Path | None, username: str | None, password: str | None) -> dict:
         """Environment for git against the repository: no user git config or
-        credential helpers, never a prompt, secrets passed through the
-        environment (not the command line). ssh_key for SSH repositories,
-        username/password for HTTP ones; tmp holds the known_hosts file."""
+        credential helpers, never a prompt, secrets passed through the environment
+        (not the command line)."""
         r = self.cfg.argocd.repo
         env = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_HTTP_LOW_SPEED_LIMIT": "1000", "GIT_HTTP_LOW_SPEED_TIME": "20", "GIT_ASKPASS": "/bin/false",
                "SSH_ASKPASS": "/bin/false"}
         if ssh_key:
-            # Same host key policy as Argo CD applies, so a host key problem
-            # shows up here rather than in the cluster.
             if r.known_hosts == "insecure":
                 hostkey = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
             else:
@@ -2736,13 +2409,10 @@ class Deployer:
         return env
 
     def check_repository(self) -> None:
-        """Validate the credential inputs and, unless disabled, check from this
-        host that the repository and revision are reachable with them."""
         r = self.cfg.argocd.repo
         creds = self.repo_credentials()  # fails early on missing or empty files
         ad = self.cfg.argocd.addons
         if ad:
-            # Write access can't be checked without pushing; the file at least.
             if ad.push_ssh_key_file:
                 self.read_secret(ad.push_ssh_key_file, "push SSH key")
                 if run(["ssh-keygen", "-y", "-P", "", "-f", str(ad.push_ssh_key_file)], check=False).returncode:
@@ -2766,7 +2436,6 @@ class Deployer:
             env = self.git_env(Path(tmp), r.ssh_key_file, creds.get("username"), creds.get("password"))
             p = run(["git", "ls-remote", r.url], env=env, check=False, timeout=60)
         if p.returncode != 0:
-            # Turn git's messages for the common failures into a clear reason.
             out = p.stdout
             if "askpass" in out or "could not read Username" in out or "Authentication failed" in out:
                 reason = "authentication failed (check username and password/token)"
@@ -2788,12 +2457,8 @@ class Deployer:
             raise DeployError(f"revision '{rev}' not found in {r.url}")
 
     def install_argocd(self, root_app: bool | None = None) -> None:
-        """Install or update Argo CD and connect it to the repository: Helm
-        release (SSH known hosts, UI URL, SSO), UI route, repository Secret and
-        root Application, then wait until the Application is Synced and
-        Healthy. Safe to re-run, e.g. to rotate credentials. root_app=False
-        leaves the root Application to apply_root_app() (after the add-ons);
-        None: as argocd.application.enabled."""
+        """root_app=False leaves the root Application to apply_root_app() (after the
+        add-ons); None: as argocd.application.enabled."""
         cfg, a = self.cfg, self.cfg.argocd
         if self.sops_mode:
             self.apply_sops_key()
@@ -2804,7 +2469,6 @@ class Deployer:
         if not self.self_managed("argocd"):
             log(f"Installing Argo CD (argo-cd chart {a.chart_version})")
             known_before = self.argocd_known_hosts()
-            # The values hold no secret (the OIDC client secret is referenced).
             self.helm_values("upgrade", "--install", "argocd", "argo-cd",
                              "--repo", "https://argoproj.github.io/argo-helm", "--version", a.chart_version,
                              "--namespace", "argocd", "--create-namespace", "--wait", "--timeout", "10m",
@@ -2833,10 +2497,6 @@ class Deployer:
             self.apply_root_app()
 
     def apply_root_app(self) -> None:
-        """The root Application (argocd.application) syncing argocd.repository.path,
-        and wait until it is Synced and Healthy. With argocd.addons it is in the
-        repository too (addons/<name>.yaml), and the one there is applied when
-        the file is kept from Git (content 'reuse')."""
         a = self.cfg.argocd
         app = self.git_or(f"{GENERATED_APPS}/{a.app_name}.yaml", self.root_app())
         log(f"Creating Application '{a.app_name}' ({app['spec']['source'].get('path')} @ {a.repo.revision})")
@@ -2849,13 +2509,10 @@ class Deployer:
         self.wait_for_sync()
 
     def git_or(self, rel: str, default: dict) -> dict:
-        """The object of a generated file kept from the repository (content
-        'reuse'), else default."""
         kept = self.kept_in_git.get(rel)
         return yaml.safe_load(kept) if kept else default
 
     def root_app(self) -> dict:
-        """The root Application object."""
         a = self.cfg.argocd
         source = {"repoURL": a.repo.url, "targetRevision": a.repo.revision, "path": a.repo.path}
         if a.repo.recurse:
@@ -2877,13 +2534,9 @@ class Deployer:
         return app
 
     def argocd_values(self) -> dict:
-        """Helm values of Argo CD. Dex (Argo CD's bundled identity broker) is
-        not used: SSO, when configured, talks to Keycloak directly. No secret
-        in them: the OIDC client secret is referenced."""
         cfg = self.cfg
         values: dict = {
             "dex": {"enabled": False},
-            # The UI is never a LoadBalancer of its own: only a route or a port-forward.
             "server": {"service": {"type": "ClusterIP"}},
             "configs": {
                 # With certManager the gateway terminates TLS: argocd-server
@@ -2924,15 +2577,11 @@ class Deployer:
             self.kubectl("-n", "argocd", "rollout", "status", "deployment/argocd-repo-server", "--timeout=5m")
 
     def argocd_known_hosts(self) -> str | None:
-        """Argo CD's SSH known hosts, or None if Argo CD isn't installed yet."""
         p = self.kubectl("-n", "argocd", "get", "configmap", "argocd-ssh-known-hosts-cm",
                          "-o", "jsonpath={.data.ssh_known_hosts}", check=False)
         return p.stdout if p.returncode == 0 else None
 
     def wait_for_sync(self, timeout: int = 600) -> None:
-        """Wait until the root Application is Synced and Healthy. Stops early
-        on a sync that failed during this wait, or on an error condition that
-        persists for two minutes (wrong credentials, missing path, ...)."""
         a = self.cfg.argocd
         log(f"Waiting for Application '{a.app_name}' to be Synced and Healthy")
         import datetime
@@ -2956,7 +2605,7 @@ class Deployer:
             if pending or not current:
                 sync = health = "Refreshing" if not errors else sync
             state = f"{sync}/{health}"
-            if state != last:          # print changes only, not every poll
+            if state != last:
                 print(f"      {state}", flush=True)
                 last = state
             if sync == "Synced" and health == "Healthy":
@@ -2970,7 +2619,6 @@ class Deployer:
             if op.get("phase") in ("Failed", "Error") and started and \
                     datetime.datetime.fromisoformat(started.replace("Z", "+00:00")) >= began:
                 raise DeployError(f"Application '{a.app_name}' sync failed: {op.get('message', '').strip()}")
-            # A persistent repository/comparison error won't fix itself.
             error_since = (error_since or time.time()) if errors else None
             if errors and time.time() - error_since > 120:
                 raise DeployError(f"Application '{a.app_name}' reports: {'; '.join(errors)}")
@@ -2981,19 +2629,15 @@ class Deployer:
                           f"Check: kubectl -n argocd describe application {a.app_name}")
 
     def apply_argocd_route(self) -> None:
-        """The UI on argocd.hostname. Without certManager: a TLSRoute (SNI)
-        passed through to argocd-server, which terminates TLS itself. With
-        certManager: a certificate, an HTTPS listener and an HTTPRoute to
-        argocd-server's plain HTTP port. Routes of the other mode are removed."""
         a = self.cfg.argocd
-        if not a.hostname or self.cfg.cert_manager:   # no route, or not this kind of route
+        if not a.hostname or self.cfg.cert_manager:
             self.kubectl("-n", "argocd", "delete", "tlsroute", "argocd-server", "--ignore-not-found", check=False)
         if not a.hostname or not self.cfg.cert_manager:
             self.kubectl("-n", "argocd", "delete", "httproute", "argocd", "argocd-redirect", "--ignore-not-found",
                          check=False)
         if not a.hostname:
             if self.cfg.cert_manager:
-                self.apply_https_gateway()   # drops the listener
+                self.apply_https_gateway()
             return
         if self.cfg.cert_manager:
             self.apply_https_gateway()
@@ -3006,7 +2650,6 @@ class Deployer:
                      input=json.dumps(route))
 
     def argocd_tlsroute(self) -> dict:
-        """TLSRoute passing argocd.hostname through to argocd-server (no certManager)."""
         route = {
             "apiVersion": "gateway.networking.k8s.io/v1", "kind": "TLSRoute",
             "metadata": {"name": "argocd-server", "namespace": "argocd"},
@@ -3026,8 +2669,6 @@ class Deployer:
         return route
 
     def print_argocd_access(self) -> None:
-        """How to reach the UI and log in (the admin password is not printed,
-        only the command that reads it)."""
         print("Argo CD:")
         if self.cfg.argocd.hostname and self.cfg.cert_manager:
             print(f"  UI:        https://{self.cfg.argocd.hostname}  (HTTPS on the ingress gateway "
@@ -3048,9 +2689,7 @@ class Deployer:
         print(f"  Local admin: admin / $({self.kubectl_bin} -n argocd get secret argocd-initial-admin-secret "
               "-o jsonpath='{.data.password}' | base64 -d)")
 
-    # -- HTTPS certificates (cert-manager) and Headlamp --------------------------
-
-    ACME_ISSUER = "acme"          # ClusterIssuer name
+    ACME_ISSUER = "acme"
     HEADLAMP_NS = "headlamp"
 
     def apply_objects(self, *objs: dict) -> None:
@@ -3089,17 +2728,14 @@ class Deployer:
 
     @staticmethod
     def cert_manager_values() -> dict:
-        """Helm values of cert-manager: CRDs from the chart, Gateway API solver on."""
         return {"crds": {"enabled": True},
-                # The controller's own configuration: enables the Gateway API solver.
                 "config": {"apiVersion": "controller.config.cert-manager.io/v1alpha1",
                            "kind": "ControllerConfiguration", "enableGatewayAPI": True}}
 
     def cluster_issuer(self) -> dict:
-        """The ClusterIssuer for the ACME server, proving names by HTTP-01 on
-        the gateway's HTTP listener. The solver's Service is a ClusterIP (the
-        gateway reaches it like any backend; cert-manager's default NodePort
-        would count against quotas that forbid NodePorts)."""
+        """The solver's Service is a ClusterIP (the gateway reaches it like any
+        backend; cert-manager's default NodePort would count against quotas that
+        forbid NodePorts)."""
         cm = self.cfg.cert_manager
         acme = {"server": cm.acme_server, "privateKeySecretRef": {"name": "acme-account-key"},
                 "solvers": [{"http01": {"gatewayHTTPRoute": {"serviceType": "ClusterIP", "parentRefs": [
@@ -3108,13 +2744,11 @@ class Deployer:
         if cm.email:
             acme["email"] = cm.email
         if cm.ca_file:
-            # cert-manager must trust a private ACME server's certificate.
             acme["caBundle"] = base64.b64encode(cm.ca_file.read_bytes()).decode()
         return {"apiVersion": "cert-manager.io/v1", "kind": "ClusterIssuer",
                 "metadata": {"name": self.ACME_ISSUER}, "spec": {"acme": acme}}
 
     def wait_issuer(self) -> None:
-        """Wait until the ACME account is registered (issuer Ready)."""
         cm = self.cfg.cert_manager
         log(f"Registering with the ACME server {cm.acme_server}")
         p = self.kubectl("wait", "--for=condition=Ready", f"clusterissuer/{self.ACME_ISSUER}", "--timeout=2m",
@@ -3125,13 +2759,10 @@ class Deployer:
             raise DeployError(f"the ACME issuer is not ready: {msg or p.stdout.strip()}")
 
     def issue_certificate(self, host: str, timeout: int = 300) -> None:
-        """Request a certificate for host (Secret tls-<host> next to the
-        gateway) and wait until it is issued."""
         self.apply_objects(self.certificate(host))
         self.wait_certificate(host, timeout)
 
     def certificate(self, host: str) -> dict:
-        """Certificate for host from the ACME issuer, Secret tls-<host> next to the gateway."""
         name = self.tls_secret(host)
         return {"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
                 "metadata": {"name": name, "namespace": self.INGRESS_NS},
@@ -3139,13 +2770,11 @@ class Deployer:
                          "issuerRef": {"name": self.ACME_ISSUER, "kind": "ClusterIssuer"}}}
 
     def wait_certificate(self, host: str, timeout: int = 300) -> None:
-        """Wait until host's certificate is issued; explain a failure."""
         name = self.tls_secret(host)
         log(f"Waiting for the certificate of {host}")
         p = self.kubectl("-n", self.INGRESS_NS, "wait", "--for=condition=Ready", f"certificate/{name}",
                          f"--timeout={timeout}s", check=False)
         if p.returncode != 0:
-            # The ACME challenge says why (DNS, connection, ...).
             reasons = self.kubectl("get", "challenges", "-A", "-o",
                                    "jsonpath={range .items[*]}{.spec.dnsName}: {.status.reason}{\"\\n\"}{end}",
                                    check=False).stdout.strip()
@@ -3157,10 +2786,9 @@ class Deployer:
     def headlamp_url(self) -> str:
         """External URL of Headlamp (Keycloak needs the exact redirect URL)."""
         h = self.cfg.headlamp
-        return f"https://{h.hostname}" if h.hostname else "http://localhost:8080"   # kubectl port-forward
+        return f"https://{h.hostname}" if h.hostname else "http://localhost:8080"
 
     def setup_keycloak_headlamp(self, url: str) -> str:
-        """The Headlamp client (confidential); returns its secret."""
         o = self.cfg.oidc
         if o.crossplane:
             return self.crossplane_client_secret(self.HEADLAMP_NS, "headlamp-oidc", "OIDC_CLIENT_SECRET")
@@ -3178,11 +2806,6 @@ class Deployer:
         return kc.client_secret(kc.ensure_client({**rep, "secret": known} if known else rep))
 
     def install_headlamp(self) -> None:
-        """Headlamp in namespace headlamp. With OIDC, users log in through
-        Keycloak and Headlamp passes their ID token to the API server, so each
-        user has exactly their own Kubernetes permissions; Headlamp's own
-        service account gets none. Without OIDC, Headlamp asks for a token.
-        With a host name: certificate, HTTPS listener, routes."""
         cfg, h = self.cfg, self.cfg.headlamp
         ns = self.HEADLAMP_NS
         self.prepare_headlamp()
@@ -3194,7 +2817,6 @@ class Deployer:
         self.kubectl("-n", ns, "rollout", "restart", "deployment/headlamp")
         self.kubectl("-n", ns, "rollout", "status", "deployment/headlamp", "--timeout=5m")
         if not h.hostname:
-            # Host name removed from the file: drop the routes and the listener.
             self.kubectl("-n", ns, "delete", "httproute", "headlamp", "headlamp-redirect", "--ignore-not-found",
                          check=False)
             self.apply_ingress_gateway(self.https_hosts())
@@ -3204,9 +2826,6 @@ class Deployer:
         self.apply_https_routes(ns, "headlamp", h.hostname, "headlamp", 80)
 
     def prepare_headlamp(self) -> None:
-        """What Headlamp needs before its chart, kept out of the chart's
-        values (and of the repository): the namespace, and with OIDC the
-        Keycloak client, its settings as a Secret, and the issuer's CA."""
         cfg = self.cfg
         ns = self.HEADLAMP_NS
         self.apply_objects({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}})
@@ -3214,8 +2833,6 @@ class Deployer:
             return
         o, url = cfg.oidc, self.headlamp_url()
         secret = self.setup_keycloak_headlamp(url)
-        # The OIDC settings, client secret included, as a Secret the chart
-        # loads into the environment (externalSecret): not in Helm values.
         self.put_secret({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                             "metadata": {"name": "headlamp-oidc", "namespace": ns},
                             "stringData": {"OIDC_CLIENT_ID": o.headlamp_client_id, "OIDC_CLIENT_SECRET": secret,
@@ -3229,9 +2846,9 @@ class Deployer:
                                 "data": {"ca.crt": o.ca_file.read_text()}})
 
     def headlamp_values(self) -> dict:
-        """Helm values of Headlamp. Users act with their own permissions (OIDC
-        token or pasted token): no cluster-admin binding for Headlamp's service
-        account. The OIDC settings come from the Secret of prepare_headlamp."""
+        """Users act with their own permissions (OIDC token or pasted token): no
+        cluster-admin binding for Headlamp's service account. The OIDC settings
+        come from the Secret of prepare_headlamp."""
         cfg = self.cfg
         values: dict = {"clusterRoleBinding": {"create": False}, "config": {"inCluster": True}}
         if cfg.oidc:
@@ -3246,7 +2863,6 @@ class Deployer:
         return values
 
     def print_headlamp_access(self) -> None:
-        """How to reach Headlamp and log in."""
         cfg, h = self.cfg, self.cfg.headlamp
         print("Headlamp:")
         if h.hostname:
@@ -3262,9 +2878,8 @@ class Deployer:
             print("  Login:     paste a service account token (no OIDC section)")
 
     def headlamp(self, assume_yes: bool) -> None:
-        """The 'headlamp' command: add or update cert-manager and Headlamp on
-        a cluster created from the file. With OIDC, the API servers must also
-        accept Headlamp's client as token audience (rolling restart if not yet)."""
+        """With OIDC, the API servers must also accept Headlamp's client as token
+        audience (rolling restart if not yet)."""
         cfg = self.cfg
         if not self.kubeconfig.exists():
             raise DeployError(f"{self.kubeconfig} not found; create the cluster first")
@@ -3288,18 +2903,12 @@ class Deployer:
         self.install_headlamp()
         self.print_headlamp_access()
 
-    # -- add-ons in Git (argocd.addons) ---------------------------------------
-
     @property
     def sops_mode(self) -> bool:
-        """argocd.addons.sopsAgeKeyFile: the add-on Secrets go to Git,
-        SOPS-encrypted, instead of being applied by the script."""
         a = self.cfg.argocd
         return bool(a and a.addons and a.addons.sops_key_file)
 
     def put_secret(self, obj: dict) -> None:
-        """A Secret of an add-on: applied directly, or in SOPS mode kept for
-        publish_addons, which encrypts it into secrets/ in the repository."""
         if self.sops_mode:
             md = obj["metadata"]
             self.git_secrets[f"secret-{md['namespace']}-{md['name']}.enc.yaml"] = obj
@@ -3307,8 +2916,6 @@ class Deployer:
             self.apply_objects(obj)
 
     def sops_key(self) -> str:
-        """The cluster's age identity (file content); generated with
-        age-keygen when the file does not exist yet."""
         f = self.cfg.argocd.addons.sops_key_file
         if not f.exists():
             if not shutil.which("age-keygen"):
@@ -3320,30 +2927,24 @@ class Deployer:
         return self.read_secret(f, "age key") + "\n"
 
     def sops_recipients(self) -> list[str]:
-        """Who can decrypt the Secrets in Git: the cluster (its key's public
-        half, from the '# public key:' line age-keygen writes) and the
-        file's sopsRecipients."""
         m = re.search(r"^# public key: (age1[0-9a-z]+)$", self.sops_key(), re.M)
         if not m:
             raise DeployError(f"{self.cfg.argocd.addons.sops_key_file} has no '# public key:' line (not an age-keygen file?)")
         return list(dict.fromkeys([m.group(1), *self.cfg.argocd.addons.sops_recipients]))
 
     def apply_sops_key(self) -> None:
-        """The cluster's age key as Secret sops-age in namespace argocd: Argo
-        CD's repo server decrypts with it. Bootstrap, so not in Git."""
+        """Bootstrap, so not in Git."""
         self.apply_objects({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "argocd"}})
         self.apply_objects({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
                             "metadata": {"name": SOPS_SECRET, "namespace": "argocd"},
                             "stringData": {"keys.txt": self.sops_key()}})
 
     def sops_env(self) -> dict:
-        """Environment for sops: decrypt with the cluster's key."""
         return {"SOPS_AGE_KEY_FILE": str(self.cfg.argocd.addons.sops_key_file)}
 
     def sops_encrypt(self, obj: dict, recipients: list[str]) -> str:
-        """A Secret encrypted for the recipients (data and stringData only,
-        so names stay readable). Plaintext goes through stdin, never a file;
-        run in an empty directory so no .sops.yaml applies."""
+        """Plaintext goes through stdin, never a file; run in an empty directory so
+        no .sops.yaml applies."""
         with tempfile.TemporaryDirectory() as tmp:
             p = subprocess.run([str(self.sops_bin), "encrypt", "--input-type", "yaml", "--output-type", "yaml",
                                 "--age", ",".join(recipients), "--encrypted-regex", "^(data|stringData)$",
@@ -3370,24 +2971,19 @@ class Deployer:
         return p.returncode == 0 and yaml.safe_load(p.stdout) == obj
 
     def self_managed(self, app: str) -> bool:
-        """With argocd.addons: the add-on's Argo CD Application exists, so the
-        add-on is synced from the repository and must not be changed with Helm."""
         if not (self.cfg.argocd and self.cfg.argocd.addons):
             return False
         return self.kubectl("-n", "argocd", "get", "application", app, check=False).returncode == 0
 
     def addon_projects(self) -> dict[str, str]:
-        """argocd.addons.projects, or their defaults without an addons section."""
         a = self.cfg.argocd
         return a.addons.projects if a and a.addons else Addons("", None, None).projects
 
     def helm_app(self, name: str, namespace: str, repo: str, chart: str, version: str, values: dict,
                  prune: bool = True, ns_labels: dict | None = None) -> dict:
-        """Argo CD Application for a Helm chart, with the values inline. The
-        release name is the Application's name, as the script's Helm releases
+        """The release name is the Application's name, as the script's Helm releases
         were, so that Argo CD takes over the existing resources (same names)."""
         policy: dict = {
-            # selfHeal: changes made in the cluster are reverted to the repository's.
             "automated": {"prune": prune, "selfHeal": True},
             # Server-side apply: large CRDs exceed client-side apply's
             # annotation limit, and it takes over fields Helm owned.
@@ -3405,9 +3001,8 @@ class Deployer:
                          "syncPolicy": policy}}
 
     def addon_apps(self) -> list[dict]:
-        """The add-on Applications for this cluster file. Cilium and Argo CD
-        never prune: a resource dropped by mistake there could cut the network
-        or Argo CD itself."""
+        """Cilium and Argo CD never prune: a resource dropped by mistake there could
+        cut the network or Argo CD itself."""
         cfg, a = self.cfg, self.cfg.argocd
         apps = []
         if cfg.lan:
@@ -3449,9 +3044,6 @@ class Deployer:
             apps.append(self.helm_app("monitoring", MONITORING_NS, "https://prometheus-community.github.io/helm-charts",
                                       "kube-prometheus-stack", cfg.monitoring.chart_version, self.monitoring_values(),
                                       ns_labels=PRIVILEGED_NS))
-        # Each topic's folder (generated/<topic>/: manifests, and Secrets that
-        # KSOPS decrypts) is synced by the add-on of the same name, as a second
-        # source; a topic without one gets an Application of its own.
         by_name = {app["metadata"]["name"]: app for app in apps}
         for topic in sorted(self.topics()):
             git = {"repoURL": a.repo.url, "targetRevision": a.repo.revision,
@@ -3476,8 +3068,6 @@ class Deployer:
         return apps
 
     def addon_repositories(self) -> list[dict]:
-        """Argo CD repository declarations the add-ons need beyond plain Helm
-        repositories: OCI registries. No credentials (public charts)."""
         if not self.cfg.tuppr:
             return []
         return [{"apiVersion": "v1", "kind": "Secret",
@@ -3487,11 +3077,6 @@ class Deployer:
                                 "enableOCI": "true"}}]
 
     def upgrade_objects(self) -> list[dict]:
-        """tuppr's upgrade resources, with the versions of the cluster file:
-        changing talos.version or kubernetesVersion and publishing them
-        (upgrade / upgrade-k8s) is what starts a rollout. Before each node,
-        the nodes must be Ready and, with Longhorn, attached volumes fully
-        replicated."""
         cfg = self.cfg
         checks = [{"apiVersion": "v1", "kind": "Node",
                    "expr": 'status.conditions.filter(c, c.type == "Ready").all(c, c.status == "True")',
@@ -3533,7 +3118,6 @@ class Deployer:
                    {"name": "talos-secrets", "secret": {"secretName": "talos-backup-secrets"}}]
         objs: list[dict] = [{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": BACKUP_NS}}]
         if b.ca_file:
-            # The S3 endpoint's CA (public), trusted through SSL_CERT_DIR.
             objs.append({"apiVersion": "v1", "kind": "ConfigMap",
                          "metadata": {"name": "s3-ca", "namespace": BACKUP_NS},
                          "data": {"ca.crt": b.ca_file.read_text()}})
@@ -3576,8 +3160,6 @@ class Deployer:
                             "stringData": keys})
 
     def run_backup(self, timeout: int = 600) -> None:
-        """Run the backup CronJob once now and wait for it: proves the Talos
-        API access, the S3 credentials and the endpoint's certificate."""
         name = f"talos-backup-{time.strftime('%Y%m%d%H%M%S')}"
         log(f"Taking an etcd backup now (job {BACKUP_NS}/{name})")
         self.kubectl("-n", BACKUP_NS, "create", "job", name, "--from=cronjob/talos-backup")
@@ -3591,7 +3173,6 @@ class Deployer:
 
     @staticmethod
     def topic_of(o: dict) -> str:
-        """The topic (folder generated/<topic>/) of a generated object."""
         md = o.get("metadata", {})
         if o["kind"] == "Namespace":
             key = md["name"]
@@ -3608,7 +3189,6 @@ class Deployer:
         return topic
 
     def topics(self) -> dict[str, dict]:
-        """{topic: {"objects": [manifests], "secrets": [encrypted file names]}}."""
         out: dict[str, dict] = {}
         for o in self.config_objects():
             out.setdefault(self.topic_of(o), {"objects": [], "secrets": []})["objects"].append(o)
@@ -3617,8 +3197,6 @@ class Deployer:
         return out
 
     def crossplane_client_secret(self, ns: str, name: str, key: str) -> str:
-        """oidc.crossplane: a client's secret is the one in Git (Crossplane
-        sets Keycloak to it, clientSecretSecretRef); a new one when Git has none."""
         return self.secret_in_git(ns, name, key) or secrets.token_urlsafe(32)
 
     def keycloak_ids(self) -> dict:
@@ -3640,10 +3218,6 @@ class Deployer:
 
     def crossplane_managed(self, kind: str, api: str, name: str, ns: str, external: str | None,
                            for_provider: dict, **spec) -> dict:
-        """A Crossplane managed resource (provider-keycloak, namespaced) of
-        oidc.crossplane: never deleted (no Delete), only observed while
-        observeOnly (taking over existing objects: compare status.atProvider
-        first); LateInitialize when Keycloak assigns the id (no external name)."""
         o = self.cfg.oidc
         policies = ["Observe"] if o.crossplane_observe_only else \
             ["Observe", "Create", "Update"] + ([] if external else ["LateInitialize"])
@@ -3656,11 +3230,6 @@ class Deployer:
                          **spec, "forProvider": for_provider}}
 
     def keycloak_client_objects(self) -> list[dict]:
-        """oidc.crossplane: the Headlamp and Grafana clients, their 'groups'
-        claims and Grafana's admin groups as Crossplane objects, next to the
-        add-on (generated/headlamp, generated/monitoring). The settings are
-        those the script would set; the secret comes from the add-on's
-        Secret in Git."""
         o = self.cfg.oidc
         if not (o and o.crossplane):
             return []
@@ -3684,7 +3253,6 @@ class Deployer:
                 {"realmId": o.realm, "clientId": cid, "name": f"{title} {self.cfg.name}", "enabled": True,
                  "accessType": "CONFIDENTIAL", "clientAuthenticatorType": "client-secret",
                  "clientSecretSecretRef": {"name": secret, "key": key},
-                 # Browser login only (authorization code flow).
                  "standardFlowEnabled": True, "implicitFlowEnabled": False, "directAccessGrantsEnabled": False,
                  "serviceAccountsEnabled": False, "validRedirectUris": [f"{url}{callback}"], "webOrigins": [url],
                  "validPostLogoutRedirectUris": [f"{url}/*"], "frontchannelLogoutEnabled": False,
@@ -3692,7 +3260,6 @@ class Deployer:
                  "fullScopeAllowed": True, "consentRequired": False,
                  # Keycloak's default; set because the provider reads unset as false.
                  "useRefreshTokens": True, **extra}))
-            # Group memberships as a flat "groups" claim (names, not paths).
             # The client by id when it exists: references aren't resolved
             # while only observing.
             client = {"clientId": uid} if uid else {"clientIdRef": {"name": cid}}
@@ -3705,9 +3272,6 @@ class Deployer:
         return objs
 
     def config_objects(self) -> list[dict]:
-        """Plain manifests, each synced with its topic (generated/<topic>/):
-        the ingress gateway and its certificates, the ACME issuer, the UI
-        routes, the upgrades, the etcd backup."""
         cfg = self.cfg
         hosts = self.https_hosts()
         objs: list[dict] = []
@@ -3738,15 +3302,7 @@ class Deployer:
         return objs
 
     def addon_files(self) -> dict[str, str]:
-        """{path relative to argocd.addons.path: content} of the generated
-        files (the encrypted Secrets are added by publish_addons):
-        addons/generated/<app>.yaml (Applications, synced by the 'addons'
-        app-of-apps), generated/<topic>/ (manifests <kind>-<namespace>-<name>.yaml
-        and a kustomization.yaml, with a KSOPS generator for its Secrets) and
-        generated/gateway-api/."""
         files = {}
-        # The root Applications as well, so the repository alone can rebuild
-        # the cluster's Argo CD view; the app-of-apps lists itself.
         files[f"{GENERATED_APPS}/{ADDONS_APP}.yaml"] = ADDONS_MARK + yaml_dump(self.addons_app())
         if self.cfg.argocd.root_app:
             files[f"{GENERATED_APPS}/{self.cfg.argocd.app_name}.yaml"] = ADDONS_MARK + yaml_dump(self.root_app())
@@ -3767,8 +3323,6 @@ class Deployer:
                 names.append(name)
             files.update(self.topic_kustomization(topic, sorted(names), sorted(t["secrets"])))
         if self.sops_mode:
-            # For people editing or adding encrypted files under this folder
-            # (run sops from inside it): who to encrypt for.
             files[".sops.yaml"] = ADDONS_MARK + yaml_dump({"creation_rules": [
                 {"path_regex": r".*\.enc\.yaml$", "encrypted_regex": "^(data|stringData)$",
                  "age": ",".join(self.sops_recipients())}]})
@@ -3776,8 +3330,6 @@ class Deployer:
 
     @staticmethod
     def topic_kustomization(topic: str, resources: list[str], secrets: list[str]) -> dict[str, str]:
-        """generated/<topic>/kustomization.yaml, and generator.yaml (KSOPS)
-        when the topic has Secrets."""
         k: dict = {"apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization"}
         if resources:
             k["resources"] = resources
@@ -3793,8 +3345,6 @@ class Deployer:
         return out
 
     def clone_addons_repo(self, tmp: Path) -> tuple[Path, dict]:
-        """Shallow clone of the repository with the push credential, into
-        tmp/repo; returns it and the git environment."""
         a = self.cfg.argocd
         ad, r = a.addons, a.repo
         token = self.read_secret(ad.push_token_file, "push token") if ad.push_token_file else None
@@ -3808,10 +3358,8 @@ class Deployer:
         return work, env
 
     def secret_in_git(self, namespace: str, name: str, key: str) -> str | None:
-        """SOPS mode: the value of a key of a Secret this cluster already has in
-        the repository (generated/<topic>/), decrypted with the cluster's key; None
-        when there is none. Git holds the credentials it has: they are used,
-        never replaced (a rebuilt Keycloak gets the client secret from Git)."""
+        """Git holds the credentials it has: they are used, never replaced (a rebuilt
+        Keycloak gets the client secret from Git)."""
         if not self.sops_mode:
             return None
         if self._secrets_in_git is None:
@@ -3837,11 +3385,6 @@ class Deployer:
         return self._secrets_in_git.get(f"secret-{namespace}-{name}.enc.yaml", {}).get(key)
 
     def publish_addons(self, files: dict[str, str] | None = None, message: str | None = None) -> str:
-        """Write the generated files into the repository and push them (with
-        the push credential). Generated files no longer generated are removed;
-        files without the generated marker (added by hand, e.g. more
-        Applications in addons/) are left alone. Returns the commit the
-        branch now points at (pushed or already there)."""
         a = self.cfg.argocd
         ad, r = a.addons, a.repo
         files = self.addon_files() if files is None else files
@@ -3860,7 +3403,6 @@ class Deployer:
                     files[rel] = f.read_text() if (reuse and f.exists()) \
                         or self.sops_unchanged(f, obj, recipients) else self.sops_encrypt(obj, recipients)
             if reuse:
-                # Each topic's generator lists every encrypted file kept or added.
                 for topic in {rel.split("/")[1] for rel in files if rel.startswith(f"{GENERATED}/")
                               and rel.count("/") == 2}:
                     d = base / GENERATED / topic
@@ -3879,7 +3421,6 @@ class Deployer:
                 if self.kept_in_git:
                     log(f"content: reuse: {len(self.kept_in_git)} file(s) in {ad.path} kept as they are in Git")
             if not reuse:
-                # addons/generated/ and generated/ belong to the script entirely.
                 for top in (GENERATED_APPS, GENERATED):
                     for f in sorted((base / top).rglob("*")) if (base / top).is_dir() else []:
                         if f.is_file() and str(f.relative_to(base)) not in files:
@@ -3928,18 +3469,15 @@ class Deployer:
         return sha
 
     def apply_addons_app(self) -> None:
-        """The app-of-apps syncing <path>/addons. It is in that folder itself
-        (addons/addons.yaml), so Argo CD manages it from Git once the script
-        has applied it (the bootstrap). Removing a generated file removes its
-        Application, but not what the Application deployed: the Applications
-        have no deletion finalizer."""
+        """Removing a generated file removes its Application, but not what the
+        Application deployed: the Applications have no deletion finalizer."""
         self.apply_objects(self.git_or(f"{GENERATED_APPS}/{ADDONS_APP}.yaml", self.addons_app()))
 
     def addons_app(self) -> dict:
-        """The app-of-apps object."""
         a = self.cfg.argocd
         return {"apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
                "metadata": {"name": ADDONS_APP, "namespace": "argocd"},
+               # The app-of-apps stays in default: it creates the projects, so it can't wait for one.
                "spec": {"project": "default",
                         # Recursive: the generated Applications are in addons/generated/,
                         # those added by hand in addons/ itself.
@@ -3951,10 +3489,9 @@ class Deployer:
                                                                           "maxDuration": "3m"}}}}}
 
     def wait_addons(self, names: list[str], revision: str, timeout: int = 1200) -> None:
-        """Wait until the Applications (the app-of-apps first, then the
-        add-ons) are Synced and Healthy, printing state changes. Those reading
-        the repository must be synced at revision (the commit just pushed):
-        until Argo CD has fetched it, "Synced" refers to the previous one."""
+        """Those reading the repository must be synced at revision (the commit just
+        pushed): until Argo CD has fetched it, "Synced" refers to the previous
+        one."""
         for n in (ADDONS_APP, *names):
             self.kubectl("-n", "argocd", "annotate", "application", n, "argocd.argoproj.io/refresh=hard",
                          "--overwrite", check=False)
@@ -3989,9 +3526,6 @@ class Deployer:
             time.sleep(10)
 
     def wait_tuppr(self, kind: str, name: str, timeout: int) -> None:
-        """Follow a tuppr upgrade resource until it has Completed the current
-        spec (observedGeneration), printing phase and node changes; fail on
-        Failed with tuppr's message."""
         log(f"Waiting for {kind} '{name}' (kubectl get {kind} {name} -w to follow it)")
         deadline, last = time.time() + timeout, ""
         while True:
@@ -4014,7 +3548,6 @@ class Deployer:
                 raise DeployError(f"{kind} '{name}' not completed after {timeout}s (phase {st.get('phase')})")
             time.sleep(15)
 
-    # Helm releases the script installed, by Application name: (release, namespace).
     HELM_RELEASES = {"cilium": ("cilium", "kube-system"), "argocd": ("argocd", "argocd"),
                      "cert-manager": ("cert-manager", "cert-manager"), "headlamp": ("headlamp", "headlamp"),
                      "longhorn": ("longhorn", LONGHORN_NS)}
@@ -4032,9 +3565,6 @@ class Deployer:
                 log(f"Helm release '{release}' handed over to Argo CD (Helm's release record removed)")
 
     def sync_addons(self) -> None:
-        """argocd.addons: prepare what stays outside the repository (Secrets,
-        Keycloak clients), push the add-on definitions, sync them through the
-        'addons' app-of-apps, then the same checks as after a Helm install."""
         cfg = self.cfg
         # Every Secret is gathered on each run: in SOPS mode a Secret not
         # gathered would be dropped from the repository.
@@ -4076,13 +3606,10 @@ class Deployer:
             self.wait_for("the resource metrics API (kubectl top)",
                           lambda: self.kubectl("top", "nodes", check=False).returncode == 0, 30, 10)
         if cfg.talos_backup:
-            # Proves the whole chain once; later runs follow the schedule.
             p = self.kubectl("-n", BACKUP_NS, "get", "cronjob", "talos-backup", "-o",
                              "jsonpath={.status.lastSuccessfulTime}", check=False)
             if not p.stdout.strip():
                 self.run_backup()
-
-    # -- metrics-server and monitoring ---------------------------------------
 
     def metrics_server_values(self) -> dict:
         """Helm values of metrics-server. Talos' kubelets serve self-signed
@@ -4095,11 +3622,9 @@ class Deployer:
     def grafana_url(self) -> str:
         """External URL of Grafana (Keycloak needs the exact redirect URL)."""
         m = self.cfg.monitoring
-        return f"https://{m.hostname}" if m.hostname else "http://localhost:3000"   # kubectl port-forward
+        return f"https://{m.hostname}" if m.hostname else "http://localhost:3000"
 
     def setup_keycloak_grafana(self, url: str) -> str:
-        """The Grafana client (confidential) and its admin groups; returns
-        the client's secret."""
         o = self.cfg.oidc
         if o.crossplane:
             return self.crossplane_client_secret(MONITORING_NS, "grafana-oidc", "GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET")
@@ -4118,19 +3643,13 @@ class Deployer:
         return kc.client_secret(kc.ensure_client({**rep, "secret": known} if known else rep))
 
     def cluster_secret(self, ns: str, name: str, key: str) -> str | None:
-        """A key of a Secret in the running cluster, None if absent."""
         p = self.kubectl("-n", ns, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}", check=False)
         return base64.b64decode(p.stdout.strip()).decode() if p.returncode == 0 and p.stdout.strip() else None
 
     def prepare_monitoring(self) -> None:
-        """What the monitoring chart needs outside its values: the namespace
-        (privileged: node-exporter), Grafana's admin password, and with OIDC
-        the Keycloak client, its secret and the issuer's CA. Passwords
-        already in Git or in the cluster are kept."""
         cfg, ns = self.cfg, MONITORING_NS
         self.apply_objects({"apiVersion": "v1", "kind": "Namespace",
                             "metadata": {"name": ns, "labels": PRIVILEGED_NS}})
-        # The local admin account: a way in when Keycloak is down.
         password = self.secret_in_git(ns, "grafana-admin", "admin-password") \
             or self.cluster_secret(ns, "grafana-admin", "admin-password") or secrets.token_urlsafe(24)
         self.put_secret({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
@@ -4151,12 +3670,10 @@ class Deployer:
                                 "data": {"ca.crt": o.ca_file.read_text()}})
 
     def monitoring_values(self) -> dict:
-        """Helm values of kube-prometheus-stack. Prometheus picks up every
-        ServiceMonitor, PodMonitor and rule in the cluster, not only the
-        chart's. Talos binds the controller manager, scheduler and etcd
-        metrics to localhost (and Cilium replaces kube-proxy): their scrape
-        jobs and rules are off, they would only report targets down. Volumes
-        on Longhorn when the cluster has it."""
+        """Prometheus picks up every ServiceMonitor, PodMonitor and rule in the
+        cluster, not only the chart's. Talos binds the controller manager,
+        scheduler and etcd metrics to localhost (and Cilium replaces kube-proxy):
+        their scrape jobs and rules are off, they would only report targets down."""
         cfg, m = self.cfg, self.cfg.monitoring
         size = int(m.storage_size[:-2])
         prom: dict = {
@@ -4186,7 +3703,6 @@ class Deployer:
         if cfg.oidc:
             o = cfg.oidc
             endpoint = f"{o.issuer}/protocol/openid-connect"
-            # Members of the admin groups are Grafana admins, everyone else a viewer.
             admin = " || ".join(f"contains(groups[*], '{g}')" for g in o.grafana_admin_groups) or "false"
             ini["auth.generic_oauth"] = {
                 "enabled": True, "name": "Keycloak", "allow_sign_up": True, "auto_login": False,
@@ -4208,7 +3724,6 @@ class Deployer:
         rules = {r: False for r in ("etcd", "kubeControllerManager", "kubeSchedulerAlerting",
                                     "kubeSchedulerRecording", "kubeProxy", "windows")}
         return {
-            # Short names: monitoring-prometheus, monitoring-alertmanager, ...
             "fullnameOverride": "monitoring",
             "cleanPrometheusOperatorObjectNames": True,
             "defaultRules": {"rules": rules},
@@ -4230,14 +3745,12 @@ class Deployer:
             "kubeEtcd": {"enabled": False},
             "kubeProxy": {"enabled": False},
             "prometheus": {"prometheusSpec": prom},
-            # No receivers yet: alerts show in Alertmanager and Grafana only.
             "alertmanager": {"alertmanagerSpec": {
                 "resources": {"requests": {"cpu": "20m", "memory": "64Mi"}, "limits": {"memory": "256Mi"}}}},
             "grafana": grafana,
         }
 
     def print_monitoring_access(self) -> None:
-        """How to reach Grafana and log in."""
         cfg, m = self.cfg, self.cfg.monitoring
         print("Grafana:")
         if m.hostname:
@@ -4251,14 +3764,7 @@ class Deployer:
         print(f"  Local admin: user admin, password: {self.kubectl_bin} -n {MONITORING_NS} get secret grafana-admin "
               "-o jsonpath='{.data.admin-password}' | base64 -d")
 
-    # -- Longhorn storage ----------------------------------------------------
-
     def install_longhorn(self) -> None:
-        """Longhorn in namespace longhorn-system. Replicas live only on the
-        storage nodes (default disk on labelled nodes, at /var/mnt/longhorn);
-        the CSI plugin and engines run on every worker, so any workload can
-        mount a volume. The 'longhorn' StorageClass is the default one unless
-        the file says otherwise."""
         lh = self.cfg.longhorn
         self.apply_objects({"apiVersion": "v1", "kind": "Namespace",
                             "metadata": {"name": LONGHORN_NS, "labels": PRIVILEGED_NS}})
@@ -4269,9 +3775,6 @@ class Deployer:
         self.wait_longhorn()
 
     def longhorn_values(self) -> dict:
-        """Helm values of Longhorn: tolerate the storage nodes' taint, disks
-        only on the labelled storage nodes, replicas and StorageClass from the
-        file."""
         lh = self.cfg.longhorn
         key, value = STORAGE_TAINT.split("=")
         toleration = {"key": key, "operator": "Equal", "value": value, "effect": "NoSchedule"}
@@ -4282,8 +3785,6 @@ class Deployer:
                 # ... and those Longhorn deploys itself (instance managers,
                 # CSI plugin, share managers): a "kubectl taint" string.
                 "taintToleration": f"{STORAGE_TAINT}:NoSchedule",
-                # A default disk only where the node label asks for one (the
-                # storage nodes), on their data disk.
                 "createDefaultDiskLabeledNodes": True,
                 "defaultDataPath": "/var/mnt/longhorn",
                 # The data disk holds nothing else: no space set aside for the OS.
@@ -4300,7 +3801,6 @@ class Deployer:
         return values
 
     def wait_longhorn(self) -> None:
-        """Wait for the CSI driver and a schedulable disk on every storage node."""
         # The CSI driver is deployed by longhorn-driver-deployer after the chart.
         self.wait_for("the Longhorn CSI driver",
                       lambda: self.kubectl("get", "csidriver", "driver.longhorn.io", check=False).returncode == 0,
@@ -4312,7 +3812,6 @@ class Deployer:
         log(f"Longhorn storage on {', '.join(storage)}")
 
     def longhorn_disk_ready(self, node: str) -> bool:
-        """The Longhorn node is ready and its disk schedulable."""
         p = self.kubectl("-n", LONGHORN_NS, "get", "nodes.longhorn.io", node, "-o", "json", check=False)
         if p.returncode != 0:
             return False
@@ -4333,10 +3832,6 @@ class Deployer:
               "  then http://localhost:8081")
 
     def longhorn(self, assume_yes: bool, drain_timeout: str, health_timeout: int) -> None:
-        """The 'longhorn' command: add Longhorn to a cluster created from the
-        file, or update it. In order: the iSCSI extensions on the existing
-        nodes (rolling reinstall with the same Talos version), the missing
-        storage nodes, then the chart."""
         cfg = self.cfg
         if not cfg.longhorn:
             raise DeployError(f"{cfg.source} has no 'longhorn' section")
@@ -4378,16 +3873,12 @@ class Deployer:
             self.install_longhorn()
         self.print_longhorn_access()
 
-    # -- scaling -------------------------------------------------------------
-
     def existing_nodes(self, short: str) -> list[int]:
-        """Indexes of this cluster's existing VMs of one kind ('cp', 'w' or 'st')."""
         pat = re.compile(rf"{re.escape(self.cfg.name)}-{short}-(\d+)")
         names = self.virsh("list", "--all", "--name").stdout.split()
         return sorted(int(m.group(1)) for n in names if (m := pat.fullmatch(n)))
 
     def lb_ips_in_use(self) -> dict[str, str]:
-        """LoadBalancer IPs currently assigned in the cluster -> 'namespace/service'."""
         svcs = json.loads(self.kubectl("get", "services", "-A", "-o", "json").stdout)["items"]
         used = {}
         for svc in svcs:
@@ -4397,20 +3888,17 @@ class Deployer:
         return used
 
     def lan_pool_in_cluster(self) -> tuple[str, str]:
-        """(start, stop) of the LoadBalancer pool as configured in the cluster."""
         pool = json.loads(self.kubectl("get", "ciliumloadbalancerippool", "lan", "-o", "json").stdout)
         block = pool["spec"]["blocks"][0]
         return block["start"], block["stop"]
 
     def set_lan_pool(self, workers: int) -> None:
-        """Move the pool's upper bound for the given number of workers."""
         start, stop = lan_pool(self.cfg, workers)
         log(f"Setting LoadBalancer pool to {start}-{stop}")
         patch = {"spec": {"blocks": [{"start": start, "stop": stop}]}}
         self.kubectl("patch", "ciliumloadbalancerippool", "lan", "--type", "merge", "-p", json.dumps(patch))
 
     def scale(self, dry_run: bool, assume_yes: bool, drain_timeout: str = "10m") -> None:
-        """Add or remove workers so that the cluster matches workers.count."""
         cfg = self.cfg
         for f in (self.kubeconfig, self.talosconfig, cfg.cluster_dir / "worker.yaml"):
             if not f.exists():
@@ -4421,9 +3909,6 @@ class Deployer:
         if len(cps) != cfg.control_planes.count:
             raise DeployError(f"control planes can't be scaled: the cluster has {len(cps)}, the file says "
                               f"{cfg.control_planes.count}. Set controlPlanes.count back to {len(cps)}.")
-        # Workers are numbered 1..count. Missing numbers up to the count are
-        # added (this also fills gaps), numbers above it are removed, highest
-        # first, so the remaining workers always stay 1..count.
         have = self.existing_nodes("w")
         want = cfg.workers.count
         add = [make_node(cfg, "worker", i) for i in range(1, want + 1) if i not in have]
@@ -4470,8 +3955,6 @@ class Deployer:
         self.kubectl("get", "nodes", "-o", "wide", capture=False)
 
     def check_new_workers(self, add: list[Node]) -> None:
-        """Before scaling out: no leftover disks, LAN addresses not handed out
-        by the LoadBalancer pool, and no machine answering on the addresses."""
         cfg = self.cfg
         for n in add:
             d = cfg.images_dirs[n.role]
@@ -4484,8 +3967,6 @@ class Deployer:
             if taken:
                 raise DeployError("the new workers' LAN addresses are assigned to LoadBalancer services: "
                                   f"{', '.join(taken)}. Free them or enlarge lan.range.")
-        # Internal addresses can only clash on an existing bridge (a created
-        # network is the cluster's alone); LAN addresses always can.
         probe = [n.ip for n in add] if cfg.existing_bridge else []
         probe += [n.lan_ip for n in add if n.lan_ip]
         if probe:
@@ -4495,7 +3976,6 @@ class Deployer:
                 raise DeployError(f"addresses of the new workers already answer: {' '.join(busy)}")
 
     def scale_out(self, add: list[Node]) -> None:
-        """Create the new workers and wait until each has joined and is Ready."""
         cfg = self.cfg
         self.fetch_talosctl()
         self.fetch_kubectl()
@@ -4506,12 +3986,8 @@ class Deployer:
         self.join_nodes(add)
 
     def join_nodes(self, add: list[Node]) -> None:
-        """Create new workers or storage nodes and wait until each has joined
-        and is Ready."""
         cfg = self.cfg
         for n in add:
-            # New nodes join with the cluster's own worker config (same
-            # secrets and settings as at creation), plus their node patch.
             patch_file = cfg.cluster_dir / "nodes" / f"{n.name}-patch.yaml"
             out = cfg.cluster_dir / "nodes" / f"{n.name}.yaml"
             patch_file.write_text(self.node_patch(n))
@@ -4530,7 +4006,6 @@ class Deployer:
             self.kubectl("wait", "--for=condition=Ready", f"node/{n.name}", "--timeout=10m")
 
     def dhcp_host(self, command: str, n: Node) -> None:
-        """Add or remove a node's DHCP reservation in the created network."""
         xml = f"<host mac='{n.mac}' name='{n.name}' ip='{n.ip}'/>"
         present = n.mac in self.virsh("net-dumpxml", self.cfg.network).stdout
         if (command == "delete") != present:
@@ -4538,9 +4013,6 @@ class Deployer:
         self.virsh("net-update", self.cfg.network, command, "ip-dhcp-host", xml, "--live", "--config")
 
     def scale_in(self, remove: list[int], drain_timeout: str) -> None:
-        """Remove workers one at a time: drain (stop, leaving it cordoned, if
-        a pod can't be evicted), delete the node object, shut the VM down
-        cleanly (forced after a minute) and delete it with its disks."""
         cfg = self.cfg
         for i in remove:
             n = make_node(cfg, "worker", i)
@@ -4565,8 +4037,6 @@ class Deployer:
             else:
                 log(f"{n.name} is not registered in Kubernetes; removing the VM only")
             log(f"Removing {n.name}")
-            # ACPI shutdown (Talos stops its services cleanly), forced off
-            # after 60 s.
             if self.virsh("domstate", n.name).stdout.strip() != "shut off":
                 self.virsh("shutdown", n.name, check=False)
                 for _ in range(30):
@@ -4583,9 +4053,7 @@ class Deployer:
         # Let libvirt's storage pool notice the deleted files.
         self.virsh("pool-refresh", "default", check=False)
         if cfg.lan:
-            self.set_lan_pool(cfg.workers.count)  # give the freed addresses back
-
-    # -- Talos upgrades ------------------------------------------------------
+            self.set_lan_pool(cfg.workers.count)
 
     def inventory(self) -> list[Node]:
         """The cluster's actual nodes (from its VMs): control planes, then
@@ -4595,9 +4063,8 @@ class Deployer:
                 + [make_node(self.cfg, "storage", i) for i in self.existing_nodes("st")])
 
     def node_version(self, ip: str) -> str | None:
-        """Talos version a node runs, or None if its API does not answer. Asks
-        the node directly (-e ip), not through the configured endpoints, so it
-        also works while a control plane or the VIP is down."""
+        """Asks the node directly (-e ip), not through the configured endpoints, so
+        it also works while a control plane or the VIP is down."""
         p = run([str(self.talosctl_bin), "--talosconfig", str(self.talosconfig), "-e", ip, "-n", ip, "version"],
                 check=False, timeout=30)
         # `talosctl version` prints a Client and a Server block; take the
@@ -4606,7 +4073,6 @@ class Deployer:
         return m.group(1) if m and p.returncode == 0 else None
 
     def wait_version(self, node: Node, version: str, timeout: int) -> None:
-        """Wait until the node answers with the given Talos version."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.node_version(node.ip) == version:
@@ -4616,11 +4082,8 @@ class Deployer:
                           f"(now: {self.node_version(node.ip) or 'unreachable'})")
 
     def cluster_health(self, timeout: int, quiet: bool = False) -> None:
-        """Health gate between steps: talosctl health (etcd, apid, kubelet,
-        control plane components), all nodes Ready, CoreDNS available and all
-        kube-system DaemonSets (Cilium, kube-proxy, ...) fully rolled out.
-        Retried until the deadline, as API access briefly drops while a
-        control plane (or the API VIP) moves."""
+        """Retried until the deadline, as API access briefly drops while a control
+        plane (or the API VIP) moves."""
         inv = self.inventory()
         cps = [n.ip for n in inv if n.role == "controlplane"]
         workers = [n.ip for n in inv if n.role != "controlplane"]
@@ -4659,9 +4122,7 @@ class Deployer:
                 time.sleep(10)
 
     def longhorn_degraded(self) -> list[str]:
-        """Attached Longhorn volumes that are not fully replicated ('name
-        (robustness)'); empty without Longhorn. Detached volumes have no live
-        replicas to compare and are skipped."""
+        """Detached volumes have no live replicas to compare and are skipped."""
         p = self.kubectl("-n", LONGHORN_NS, "get", "volumes.longhorn.io", "-o", "json", check=False)
         if p.returncode != 0:
             if "the server doesn't have a resource type" in p.stdout or "NotFound" in p.stdout:
@@ -4672,8 +4133,6 @@ class Deployer:
                 if v.get("status", {}).get("state") == "attached" and v["status"].get("robustness") != "healthy"]
 
     def missing_extensions(self, node: Node) -> list[str]:
-        """System extensions of the cluster file that the node lacks (e.g.
-        added to the file after the node was installed)."""
         p = self.talosctl("-e", node.ip, "-n", node.ip, "get", "extensions", "-o", "yaml", check=False)
         if p.returncode != 0:
             raise DeployError(f"cannot list the extensions of {node.name}: {p.stdout.strip()[-200:]}")
@@ -4683,8 +4142,6 @@ class Deployer:
         return [e for e in self.cfg.extensions if e.rsplit("/", 1)[-1] not in have]
 
     def drain(self, node: Node, timeout: str) -> None:
-        """Drain before a reboot; on failure uncordon again and explain which
-        pods blocked it."""
         p = self.kubectl("drain", node.name, "--ignore-daemonsets", "--delete-emptydir-data",
                          f"--timeout={timeout}", check=False)
         if p.returncode != 0:
@@ -4695,8 +4152,6 @@ class Deployer:
             raise DeployError(f"draining {node.name} failed within {timeout}: {why}")
 
     def upgrade_node(self, node: Node, version: str, drain_timeout: str) -> None:
-        """Drain, upgrade (Talos installs to its other A/B slot and reboots),
-        check the new version, wait for Ready, uncordon."""
         log(f"Draining {node.name}")
         self.drain(node, drain_timeout)
         log(f"Upgrading {node.name} with {self.installer_image()}")
@@ -4713,9 +4168,9 @@ class Deployer:
         self.ready_and_uncordon(node)
 
     def ready_and_uncordon(self, node: Node, timeout: int = 600) -> None:
-        """Wait for the node to be Ready, then uncordon it. Both are retried:
-        with a single control plane, the Kubernetes API is down while that
-        node reboots, and a failed uncordon would leave it unschedulable."""
+        """Both are retried: with a single control plane, the Kubernetes API is down
+        while that node reboots, and a failed uncordon would leave it
+        unschedulable."""
         self.wait_for(f"{node.name} to be Ready",
                       lambda: self.kubectl("wait", "--for=condition=Ready", f"node/{node.name}",
                                            "--timeout=10s", check=False).returncode == 0, timeout // 15, 5)
@@ -4723,7 +4178,6 @@ class Deployer:
                       lambda: self.kubectl("uncordon", node.name, check=False).returncode == 0, 60, 5)
 
     def rollback_node(self, node: Node, version: str) -> None:
-        """Boot the node's previous installation (Talos A/B) and wait for it."""
         log(f"Rolling back {node.name} to {version}")
         self.kubectl("drain", node.name, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=2m", check=False)
         p = self.talosctl("-e", node.ip, "-n", node.ip, "rollback", check=False)
@@ -4735,13 +4189,6 @@ class Deployer:
 
     def upgrade(self, dry_run: bool, assume_yes: bool, drain_timeout: str, health_timeout: int,
                 on_failure: str, simulate_failure: str | None) -> None:
-        """Rolling Talos upgrade to talos.version: plan and checks (all nodes
-        answer, no downgrade, at most one minor release), then node by node,
-        control planes first, with a full health gate after each. A failure
-        triggers recover(). Nodes already on the target are skipped, so a
-        re-run continues an interrupted upgrade. A node on the target version
-        that lacks an extension of the file (e.g. after adding the longhorn
-        section) is reinstalled with the same version and the new image."""
         cfg = self.cfg
         target = cfg.talos_version
         for f in (self.kubeconfig, self.talosconfig):
@@ -4787,7 +4234,7 @@ class Deployer:
             log(f"All {len(inv)} nodes already run {target} with the file's extensions; nothing to do")
             return
 
-        self.resolve_schematic()   # the installer image of the target version
+        self.resolve_schematic()
         log(f"Upgrade plan for '{cfg.name}' to {target} (one node at a time, control planes first):")
         for i, n in enumerate(todo, 1):
             ext = f" (adds {', '.join(missing[n.name])})" if missing[n.name] else ""
@@ -4842,7 +4289,6 @@ class Deployer:
 
     def recover(self, failed: Node, old: str, reason: str, upgraded: list[Node],
                 versions: dict, target: str) -> None:
-        """Undo after a failed step and stop the rollout."""
         log(f"Step failed on {failed.name}: {reason}")
         log("Cancelling the upgrade")
         rolled, problems = [], []
@@ -4892,17 +4338,15 @@ class Deployer:
             """)
 
     def live_install_image(self, node: Node) -> str | None:
-        """The installer image in the node's running machine config."""
         p = self.talosctl("-e", node.ip, "-n", node.ip, "get", "machineconfig", "v1alpha1", "-o", "yaml", check=False)
         m = re.search(r"kind: UnattendedInstallConfig\n(?:.*\n)*?\s+image: (\S+)", p.stdout)
         return m.group(1) if p.returncode == 0 and m else None
 
     def set_live_install_image(self, node: Node) -> None:
-        """Point the node's running config at the current installer, without
-        a reboot. talosctl upgrade --image installs the new image but leaves
-        the config naming the old one; anything that upgrades from the
-        config's image (talosctl upgrade without --image, tuppr) would then
-        reinstall the old schematic and lose newer extensions."""
+        """talosctl upgrade --image installs the new image but leaves the config
+        naming the old one; anything that upgrades from the config's image
+        (talosctl upgrade without --image, tuppr) would then reinstall the old
+        schematic and lose newer extensions."""
         if self.live_install_image(node) == self.installer_image():
             return
         patch = self.cfg.cluster_dir / "install-image.yaml"
@@ -4915,12 +4359,10 @@ class Deployer:
         log(f"{node.name}: install image set to {self.installer_image()}")
 
     def update_install_image(self) -> None:
-        """Point the stored machine configs (used for new workers) at the new
-        installer. The install section is rewritten as text: a Talos config
-        patch would replace its provisioning settings (disk selector) instead
-        of merging, which also repairs files damaged that way earlier."""
+        """The install section is rewritten as text: a Talos config patch would
+        replace its provisioning settings (disk selector) instead of merging,
+        which also repairs files damaged that way earlier."""
         section = self.install_section()
-        # The document from its kind line to the next "---" or the end of file.
         block = re.compile(r"(^kind: UnattendedInstallConfig\n)(.*?)(?=^---|\Z)", re.S | re.M)
         files = [self.cfg.cluster_dir / f for f in ("controlplane.yaml", "worker.yaml")]
         files += sorted((self.cfg.cluster_dir / "nodes").glob("*.yaml"))
@@ -4932,12 +4374,9 @@ class Deployer:
             run([str(self.talosctl_bin), "validate", "--mode", "cloud", "--strict", "-c", str(f)])
         self.protect_cluster_dir()
 
-    # -- OIDC (Keycloak) authentication --------------------------------------
-
     OIDC_CRB = "oidc-cluster-admins"
 
     def check_oidc(self) -> None:
-        """Host check: CA file, issuer reachable, Keycloak admin login (managed mode)."""
         o = self.cfg.oidc
         if o.ca_file and not o.ca_file.is_file():
             raise DeployError(f"oidc.caFile {o.ca_file} not found")
@@ -4953,7 +4392,6 @@ class Deployer:
                 raise DeployError(f"OIDC issuer {o.issuer} not reachable from this host: {e}") from e
 
     def setup_keycloak_k8s(self) -> None:
-        """Realm, groups and the Kubernetes client (public; device code + PKCE)."""
         o = self.cfg.oidc
         if not o.managed:
             return
@@ -4973,7 +4411,6 @@ class Deployer:
                            "oauth2.device.authorization.grant.enabled": "true"}})
 
     def setup_keycloak_argocd(self, url: str) -> str:
-        """The Argo CD client (confidential); returns its secret."""
         o = self.cfg.oidc
         if not o.managed:
             return self.read_secret(o.argocd_client_secret_file, "Argo CD OIDC client secret")
@@ -4997,8 +4434,7 @@ class Deployer:
     ARGOCD_OIDC_SECRET = "argocd-keycloak"
 
     def argocd_oidc_values(self, values: dict) -> None:
-        """Helm values for Argo CD SSO via Keycloak (and admin group mapping).
-        The client secret is not part of them: it is stored in its own Secret
+        """The client secret is not part of them: it is stored in its own Secret
         (apply_argocd_oidc_secret), which oidc.config references, so it never
         lands in a values file, in Helm's release data or in the repository."""
         o = self.cfg.oidc
@@ -5011,8 +4447,6 @@ class Deployer:
             oidc_cfg["rootCA"] = o.ca_file.read_text()
         configs = values.setdefault("configs", {})
         configs["cm"] = {"url": url, "oidc.config": yaml_dump(oidc_cfg)}
-        # Policy lines "g, <group>, role:admin": members of these Keycloak
-        # groups (from the "groups" claim) are Argo CD admins.
         configs["rbac"] = {"scopes": "[groups]",
                            "policy.csv": "".join(f"g, {g}, role:admin\n" for g in o.argocd_admin_groups)}
 
@@ -5041,7 +4475,6 @@ class Deployer:
                      input=json.dumps(crb))
 
     def fetch_kubelogin(self) -> Path:
-        """kubelogin (kubectl OIDC plugin) of KUBELOGIN_VERSION, checksum-verified."""
         binary = self.cfg.cache_dir / "kubelogin"
         if binary.exists():
             return binary
@@ -5058,9 +4491,6 @@ class Deployer:
         return binary
 
     def write_oidc_kubeconfig(self) -> Path:
-        """kubeconfig-oidc: same clusters as the admin kubeconfig, user logs in
-        through Keycloak with kubelogin (device code: open the printed URL in
-        any browser)."""
         o = self.cfg.oidc
         kubelogin = self.fetch_kubelogin()
         admin = yaml.safe_load(self.kubeconfig.read_text())
@@ -5068,8 +4498,6 @@ class Deployer:
                 "--grant-type=device-code"]
         if o.ca_file:
             args.append(f"--certificate-authority={o.ca_file}")
-        # kubectl runs kubelogin (exec credential plugin) to get a token; the
-        # cluster entries, CA included, are copied from the admin kubeconfig.
         user = f"oidc@{self.cfg.name}"
         kc = {"apiVersion": "v1", "kind": "Config", "clusters": admin["clusters"],
               "contexts": [{"name": user, "context": {"cluster": admin["clusters"][0]["name"], "user": user}}],
@@ -5083,23 +4511,19 @@ class Deployer:
         return path
 
     def finish_oidc(self) -> None:
-        """Cluster-side part of OIDC, once the API is up: RBAC and kubeconfig-oidc."""
         log(f"Binding Keycloak group(s) {', '.join(self.cfg.oidc.k8s_admin_groups)} to cluster-admin")
         self.apply_oidc_rbac()
         path = self.write_oidc_kubeconfig()
         log(f"Wrote {path} (Keycloak login via kubelogin)")
 
     def oidc_configured_on(self, node: Node) -> bool:
-        """The node's authentication configuration equals the one from the file."""
         spec = self.talosctl("-e", node.ip, "-n", node.ip, "get", "mc", "v1alpha1", "-o", "jsonpath={.spec}",
                              check=False).stdout
-        # The machine config is a multi-document YAML; find the auth document.
         docs = [d for d in yaml.safe_load_all(spec) if isinstance(d, dict)]
         current = next((d.get("configuration") for d in docs if d.get("kind") == "KubeAuthenticationConfig"), None)
         return current == yaml.safe_load(oidc_auth_patch(self.cfg.oidc))["configuration"]
 
     def apiserver_state(self, node: Node) -> tuple[str, bool]:
-        """(container start time, ready) of a node's kube-apiserver."""
         p = self.kubectl("-n", "kube-system", "get", "pod", f"kube-apiserver-{node.name}", "-o", "jsonpath="
                          "{.status.containerStatuses[0].state.running.startedAt} {.status.containerStatuses[0].ready}",
                          check=False)
@@ -5121,7 +4545,6 @@ class Deployer:
                           f"within {timeout}s")
 
     def enable_oidc(self, assume_yes: bool) -> None:
-        """Add Keycloak (OIDC) authentication to an existing cluster."""
         cfg = self.cfg
         if not cfg.oidc:
             raise DeployError(f"{cfg.source} has no 'oidc' section")
@@ -5144,11 +4567,8 @@ class Deployer:
             self.print_headlamp_access()
 
     def configure_apiservers_oidc(self, assume_yes: bool) -> bool:
-        """Bring the API servers' authentication configuration in line with the
-        file (Keycloak realm, groups and kubectl client first). Returns False
-        if the user declined the restarts."""
+        """Returns False if the user declined the restarts."""
         cfg = self.cfg
-        # Only control planes run an API server; skip those already configured.
         cps = [n for n in self.inventory() if n.role == "controlplane"]
         todo = [n for n in cps if not self.oidc_configured_on(n)]
         log(f"API servers to configure for {cfg.oidc.issuer}: {', '.join(n.name for n in todo) or 'none'}")
@@ -5182,10 +4602,7 @@ class Deployer:
             patch.unlink(missing_ok=True)
         return True
 
-    # -- Kubernetes upgrades -------------------------------------------------
-
     def talos_default_k8s(self) -> str:
-        """Default (and newest supported) Kubernetes version of the Talos release."""
         # talosctl has no command printing it; its --to flag's default is it.
         out = run([str(self.talosctl_bin), "upgrade-k8s", "--help"]).stdout
         m = re.search(r'--to string .*\(default "([0-9.]+)"\)', out)
@@ -5201,7 +4618,6 @@ class Deployer:
         return api.lstrip("v").split("+")[0], kubelets   # drop build metadata (+...)
 
     def removed_api_usage(self, target: str) -> list[str]:
-        """API versions used since the API server started that the target removes."""
         tv = _semver(target)
         found = set()
         # The API server counts requests to deprecated APIs in this metric,
@@ -5218,7 +4634,6 @@ class Deployer:
         return sorted(found)
 
     def chart_kube_constraints(self) -> list[tuple[str, str]]:
-        """(chart, kubeVersion constraint) for the Helm charts this script installed."""
         charts = []
         if self.cfg.lan:
             charts.append(("cilium", "https://helm.cilium.io", self.cfg.cilium_version))
@@ -5237,10 +4652,6 @@ class Deployer:
         return out
 
     def upgrade_k8s(self, dry_run: bool, assume_yes: bool, health_timeout: int, force: bool) -> None:
-        """Kubernetes upgrade behind gates: version path, health, removed APIs
-        still in use and add-on compatibility (the last two overridable with
-        --force), then a phased per-node rollout and final checks. See the
-        'upgrade-k8s' help text for the full sequence."""
         cfg = self.cfg
         for f in (self.kubeconfig, self.talosconfig, cfg.cluster_dir / "controlplane.yaml"):
             if not f.exists():
@@ -5250,7 +4661,6 @@ class Deployer:
         inv = self.inventory()
         cps = [n for n in inv if n.role == "controlplane"]
 
-        # Gate 1: version path
         log("Gate: version path")
         stale = [n.name for n in inv if self.node_version(n.ip) != cfg.talos_version]
         if stale:
@@ -5259,7 +4669,7 @@ class Deployer:
         newest = self.talos_default_k8s()
         target = cfg.kubernetes_version or newest
         current, kubelets = self.k8s_versions()
-        cv, tv, nv = _semver(current), _semver(target), _semver(newest)   # current, target, newest
+        cv, tv, nv = _semver(current), _semver(target), _semver(newest)
         oldest_minor = nv[1] - 5   # Talos supports 6 Kubernetes minors back from its default
         if tv[0] != nv[0] or not oldest_minor <= tv[1] <= nv[1]:
             raise DeployError(f"Talos {cfg.talos_version} supports Kubernetes {nv[0]}.{oldest_minor} to {newest}; "
@@ -5274,15 +4684,12 @@ class Deployer:
               + ", ".join(f"{v} on {sum(1 for x in kubelets.values() if x == v)}" for v in sorted(set(kubelets.values()))))
         print(f"      target {target}" + ("" if cfg.kubernetes_version else f" (default of Talos {cfg.talos_version})"))
         if current == target and not behind and not self.k8s_components_behind(target, inv):
-            # Nothing to roll out; still fix the stored configs if needed.
             self.update_k8s_images(target)
             log(f"Kubernetes is already at {target} everywhere; nothing to do")
             return
 
-        # Gate 2: health
         self.cluster_health(min(health_timeout, 300))
 
-        # Gate 3 + 4: removed APIs and add-on compatibility (overridable)
         problems = []
         log(f"Gate: API versions removed by {target}")
         removed = self.removed_api_usage(target)
@@ -5320,8 +4727,6 @@ class Deployer:
             self.verify_k8s_upgrade(target, health_timeout)
             return
         if dry_run:
-            # Show only the interesting lines of talosctl's verbose plan: the
-            # component updates, and a count of manifest changes by kind.
             log("Talos upgrade plan (talosctl upgrade-k8s --dry-run)")
             p = self.talosctl("-e", ep, "-n", ep, "upgrade-k8s", "--from", current, "--to", target, "--dry-run",
                               check=False)
@@ -5373,10 +4778,7 @@ class Deployer:
         self.update_k8s_images(target)
         log(f"Kubernetes {target} runs on all {len(inv)} nodes")
 
-    # -- phased per-node rollout with VIP handover --
-
     def vip_spec(self) -> tuple[str, str] | None:
-        """(VIP address, link) when the API is served on a Talos VIP."""
         cfg = self.cfg
         if cfg.lan:
             return lan_vip(cfg), LAN_LINK
@@ -5385,7 +4787,6 @@ class Deployer:
         return None
 
     def vip_holder(self) -> Node | None:
-        """The control plane currently holding the API VIP (None: no VIP, or no holder)."""
         vip = self.vip_spec()
         if not vip:
             return None
@@ -5396,7 +4797,6 @@ class Deployer:
         return None
 
     def k8s_rollout_order(self, cps: list[Node]) -> list[Node]:
-        """Control planes with the current VIP holder last (fewest handovers)."""
         holder = self.vip_holder()
         return [n for n in cps if not holder or n.name != holder.name] + \
                [n for n in cps if holder and n.name == holder.name]
@@ -5435,7 +4835,6 @@ class Deployer:
             patch.unlink(missing_ok=True)
 
     def node_k8s_images(self, node: Node) -> dict[str, str]:
-        """{document kind: image} of the Kubernetes components in a node's config."""
         spec = self.talosctl("-e", node.ip, "-n", node.ip, "get", "mc", "v1alpha1", "-o", "jsonpath={.spec}").stdout
         return {d["kind"]: d["image"] for d in yaml.safe_load_all(spec)
                 if isinstance(d, dict) and "image" in d and d.get("kind", "").startswith("Kube")}
@@ -5444,7 +4843,6 @@ class Deployer:
                   "KubeSchedulerConfig": "kube-scheduler"}
 
     def static_pods_on(self, node: Node, images: dict[str, str]) -> bool:
-        """The node's control plane static pods run the expected image ({kind: image}) and are ready."""
         for kind, image in images.items():
             comp = self.STATIC_POD[kind]
             p = self.kubectl("-n", "kube-system", "get", "pod", f"{comp}-{node.name}", "-o", "json", check=False)
@@ -5458,11 +4856,8 @@ class Deployer:
         return True
 
     def k8s_upgrade_node(self, node: Node, target: str, kind: str, health_timeout: int) -> None:
-        """Move one component (config document kind) on one node to the target."""
         label = self.STATIC_POD.get(kind, "kubelet")
         current = self.node_k8s_images(node)
-        # The new image is the current one with the tag replaced (same
-        # registry and repository); nothing to do if it already has it.
         todo = {kind: re.sub(r":v[0-9.]+$", f":v{target}", current[kind])} \
             if kind in current and not current[kind].endswith(f":v{target}") else {}
         if not todo:
@@ -5500,9 +4895,7 @@ class Deployer:
         self.cluster_health(health_timeout)
 
     def k8s_components_behind(self, target: str, inv: list[Node]) -> list[str]:
-        """Components not yet on the target: per-node control plane images and
-        kubelets in the machine configs, and the kube-proxy DaemonSet. Catches
-        an earlier run that stopped after the kubelets but before phase 3."""
+        """Catches an earlier run that stopped after the kubelets but before phase 3."""
         behind = []
         for n in inv:
             for kind, image in self.node_k8s_images(n).items():
@@ -5515,9 +4908,6 @@ class Deployer:
         return behind
 
     def verify_k8s_upgrade(self, target: str, timeout: int) -> None:
-        """Post-upgrade gate: API server, every kubelet and every control plane
-        and kube-proxy pod report the target; then cluster health, and the
-        Argo CD root Application Synced/Healthy when there is one."""
         log("Gate: component versions")
         deadline = time.time() + timeout
         while True:
@@ -5525,7 +4915,6 @@ class Deployer:
             pods = json.loads(self.kubectl("-n", "kube-system", "get", "pods", "-o", "json").stdout)["items"]
             stale = [f"API server {api}"] if api != target else []
             stale += [f"kubelet on {n} ({v})" for n, v in kubelets.items() if v != target]
-            # Images of the control plane and kube-proxy pods, by tag.
             for pod in pods:
                 if pod["metadata"].get("labels", {}).get("k8s-app") in (
                         "kube-apiserver", "kube-controller-manager", "kube-scheduler", "kube-proxy"):
@@ -5544,7 +4933,6 @@ class Deployer:
             self.wait_for_sync(timeout)
 
     def k8s_state(self) -> str:
-        """One-line summary of the versions, for error messages."""
         try:
             api, kubelets = self.k8s_versions()
             return f"Current state: API server {api}; kubelets " + ", ".join(f"{n}={v}" for n, v in sorted(kubelets.items()))
@@ -5552,9 +4940,6 @@ class Deployer:
             return "Current state: the Kubernetes API does not answer"
 
     def update_k8s_images(self, target: str) -> None:
-        """Point the stored machine configs (used for new workers) at the new
-        Kubernetes images, so new nodes join with the upgraded kubelet."""
-        # Replace the tag of every Kubernetes component image, keeping the rest.
         pattern = re.compile(r"((?:kube-apiserver|kube-controller-manager|kube-scheduler|kube-proxy|kubelet):)v[0-9.]+")
         files = [self.cfg.cluster_dir / f for f in ("controlplane.yaml", "worker.yaml")]
         files += sorted((self.cfg.cluster_dir / "nodes").glob("*.yaml"))
@@ -5564,11 +4949,7 @@ class Deployer:
             if new != text:
                 f.write_text(new)
 
-    # -- commands ------------------------------------------------------------
-
     def gitops(self) -> None:
-        """Install or update Argo CD on a cluster this script created; with
-        argocd.addons, also publish and sync all the add-ons."""
         if not self.kubeconfig.exists():
             raise DeployError(f"{self.kubeconfig} not found; create the cluster first")
         self.check_repository()
@@ -5605,7 +4986,6 @@ class Deployer:
             self.setup_keycloak_k8s()   # the issuer must exist when the API servers start
         if not cfg.existing_bridge:
             self.create_network()
-        # All VMs start at once; they configure themselves from their ISO.
         for n in nodes(cfg):
             self.create_node(n)
         self.bootstrap()
@@ -5666,10 +5046,6 @@ class Deployer:
         return cfg.network == f"talos-{cfg.name}" and "<metadata>" not in xml
 
     def destroy(self) -> None:
-        """Remove what create made: the VMs named <name>-cp-N/-w-N/-st-N and
-        their disks, the libvirt network if this script created it for this
-        cluster, and the cluster's Keycloak clients in managed mode. Keeps the
-        cluster directory. Finding nothing is not an error."""
         cfg = self.cfg
         pattern = re.compile(rf"{re.escape(cfg.name)}-(cp|w|st)-\d+")
         found = False
@@ -5678,7 +5054,6 @@ class Deployer:
                 continue
             found = True
             log(f"Removing {name}")
-            # Hard power-off: the whole cluster goes, nothing to shut down cleanly.
             if self.virsh("domstate", name).stdout.strip() != "shut off":
                 self.virsh("destroy", name)
             # --remove-all-storage deletes the VM's disks; anything libvirt
@@ -5711,7 +5086,6 @@ class Deployer:
             except DeployError as e:
                 log(f"WARNING: could not remove the Keycloak clients: {e}")
         if found and cfg.argocd and cfg.argocd.addons:
-            # The cluster's generated add-on files go; files added by hand stay.
             try:
                 self.publish_addons({}, f"{cfg.name}: remove the add-ons, cluster destroyed ({PROG})")
             except DeployError as e:
@@ -5722,24 +5096,17 @@ class Deployer:
             log(f"Kept {cfg.cluster_dir} (secrets, talosconfig, kubeconfig); delete it if no longer needed")
 
 
-# --------------------------------------------------------------------------
-# plan / template
-# --------------------------------------------------------------------------
-
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
 def columns(rows: list[list[str]]) -> list[str]:
-    """Jinja2 filter: align rows of cells into text lines, each column as wide
-    as its widest cell, two spaces apart."""
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     return ["  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip() for r in rows]
 
 
 def render(template: str, **context) -> str:
-    """Render a Jinja2 template from the templates/ directory next to this
-    script. Strict: an undefined variable is an error, not an empty string.
-    Jinja2 is only imported here, so the other commands don't need it."""
+    """Strict: an undefined variable is an error, not an empty string. Jinja2 is only
+    imported here, so the other commands don't need it."""
     try:
         import jinja2
     except ImportError:
@@ -5755,13 +5122,10 @@ def render(template: str, **context) -> str:
 
 
 def print_plan(cfg: Config) -> None:
-    """Human-readable summary of a cluster file (templates/plan.txt.j2):
-    settings, then one row per node."""
     print(render("plan.txt.j2", cfg=cfg, api_endpoint=api_endpoint(cfg),
                  pool=lan_pool(cfg) if cfg.lan else None, nodes=nodes(cfg)), end="")
 
 
-# Starting points for 'template --preset': name -> one-line description.
 PRESETS = {
     "minimal": "1 control plane + 2 workers, internal NAT network only (flannel)",
     "ha":      "3 control planes (internal API VIP) + 2 workers, internal NAT network only",
@@ -5770,7 +5134,7 @@ PRESETS = {
 }
 
 
-TEMPLATE_DEFAULTS = {          # site-neutral placeholders; template options override them
+TEMPLATE_DEFAULTS = {
     "lan_bridge": "br0",
     "lan_range": "192.0.2.200-229",   # RFC 5737 documentation range: replace with real addresses
     "domain": "example.com",
@@ -5779,10 +5143,6 @@ TEMPLATE_DEFAULTS = {          # site-neutral placeholders; template options ove
 
 def render_template(preset: str, name: str, secrets_dir: str | None = None, lan_bridge: str | None = None,
                     lan_range: str | None = None, domain: str | None = None, ca_file: str | None = None) -> str:
-    """A fully commented cluster file for a preset (templates/cluster.yaml.j2).
-    Every key is written with its default, so the file documents itself; the
-    optional sections are included commented out (lan is active in the LAN
-    presets)."""
     domain = domain or TEMPLATE_DEFAULTS["domain"]
     return render(
         "cluster.yaml.j2", prog=PROG, preset=preset, description=PRESETS[preset], name=name,
@@ -5793,14 +5153,7 @@ def render_template(preset: str, name: str, secrets_dir: str | None = None, lan_
         secrets_dir=json.dumps(secrets_dir) if secrets_dir else "null")
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
-
 def build_parser() -> argparse.ArgumentParser:
-    """The command line: one subcommand per operation. The help texts are the
-    reference documentation of each command, so keep them in sync with what
-    the Deployer methods do."""
     preset_lines = "\n".join(f"  {k:<8} {v}" for k, v in PRESETS.items())
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -5882,8 +5235,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", type=Path, help="write to this file instead of stdout")
     p.add_argument("--force", action="store_true", help="overwrite --output if it exists")
 
-    # The commands taking a cluster file: (name, one-line help, description),
-    # plus their specific options below.
     for name, help_text, desc in (
         ("plan", "validate a cluster file, show the address plan, run host checks",
          "Validate the file, print the resolved settings and address plan, and run the "
@@ -6031,8 +5382,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_template(args) -> None:
-    """Write a template to stdout or a file; a written file is loaded back as
-    a check that the template is a valid cluster file."""
     name = args.name or {"minimal": "dev", "ha": "ha", "lan": "lan", "lan-ha": "lan-ha"}[args.preset]
     secrets = str(Path(args.secrets_dir).expanduser().resolve()) if args.secrets_dir else None
     if args.lan_range and not re.fullmatch(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}-\d{1,3}", args.lan_range):
@@ -6053,7 +5402,6 @@ def cmd_template(args) -> None:
 
 
 def cmd_plan(args) -> None:
-    """Validate and print the plan, then run the host checks unless --no-checks."""
     cfg = load_config(args.file)
     print_plan(cfg)
     if args.no_checks:
@@ -6082,7 +5430,6 @@ def cmd_dns_records(args) -> None:
 
 
 def cmd_destroy(args) -> None:
-    """Ask for confirmation (or require --yes without a terminal), then destroy."""
     cfg = load_config(args.file)
     if not args.yes:
         if not sys.stdin.isatty():
@@ -6096,7 +5443,6 @@ def cmd_destroy(args) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse the command line, run the command, map errors to the exit status."""
     args = build_parser().parse_args(argv)
     try:
         if args.command == "template":
