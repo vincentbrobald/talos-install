@@ -5889,6 +5889,7 @@ def build_parser() -> argparse.ArgumentParser:
               {PROG} headlamp -f lab.yaml   # add the Headlamp web console later
               {PROG} longhorn -f lab.yaml   # add Longhorn storage nodes later
               {PROG} node-config -f lab.yaml  # registry mirrors etc. on running nodes
+              {PROG} omni -f lab.yaml       # import the cluster into Omni
               {PROG} dns-records -f lab.yaml --domain example.org   # records for the LAN DNS
               {PROG} destroy -f lab.yaml
 
@@ -5898,11 +5899,14 @@ def build_parser() -> argparse.ArgumentParser:
                         ingress gateway and LoadBalancer pool
               argocd    optional: Argo CD syncing a Git repository (SSH key,
                         username/password or token, read from files)
-              oidc      optional: Keycloak/OIDC login for kubectl, Argo CD and Headlamp
+              oidc      optional: Keycloak/OIDC login for kubectl, Argo CD, Headlamp
+                        and Grafana
               certManager  optional: HTTPS certificates from an ACME CA for the gateway
               headlamp  optional: Headlamp web console
               longhorn  optional: Longhorn block storage on dedicated storage nodes
+              monitoring, metricsServer  optional: Prometheus and Grafana, metrics-server
               tuppr, talosBackup  optional: upgrades by tuppr, etcd backups to S3
+              omni      optional: the Omni instance the nodes are imported into
               registry  optional: pull images through a mirror registry
               cilium, helm, paths, libvirt   versions and locations
 
