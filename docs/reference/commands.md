@@ -255,7 +255,8 @@ confirmation unless `-y`/`--yes` is given; without a terminal, `--yes` is
 required. VMs are matched by name (`<name>-cp-N`, `<name>-w-N`, `<name>-st-N`;
 storage nodes' data disks go too). The cluster
 directory is **kept**, because it holds the secrets. When the script manages
-Keycloak, the cluster's Keycloak clients are removed too; the realm and
+Keycloak, the cluster's Keycloak clients (Kubernetes, Argo CD, Headlamp,
+Grafana: those it has) are removed too; the realm and
 groups stay. With `argocd.addons`, the cluster's generated files are removed
 from the repository. Delete it yourself when it
 is no longer needed. Running `destroy` on a cluster that's already gone is

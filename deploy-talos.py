@@ -5778,7 +5778,8 @@ class Deployer:
             # The cluster's own Keycloak clients; the realm and groups are shared.
             try:
                 kc = KeycloakAdmin(cfg.oidc)
-                for client_id in (cfg.oidc.k8s_client_id, cfg.oidc.argocd_client_id, cfg.oidc.headlamp_client_id):
+                for client_id in (cfg.oidc.k8s_client_id, cfg.oidc.argocd_client_id, cfg.oidc.headlamp_client_id,
+                                  cfg.oidc.grafana_client_id):
                     if not client_id:
                         continue
                     if kc.delete_client(client_id):
@@ -6038,7 +6039,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("destroy", "remove the cluster's VMs, disks and network",
          "Remove the cluster's VMs, disks and config ISOs, its libvirt network (only one this "
          "script created for this cluster; an existing bridge is never touched) and, when the "
-         "script manages Keycloak, the cluster's two Keycloak clients (realm and groups stay). "
+         "script manages Keycloak, the cluster's Keycloak clients: Kubernetes, Argo CD, Headlamp "
+         "and Grafana, those it has (realm and groups stay). "
          "The cluster directory (secrets, talosconfig, kubeconfig) is kept."),
     ):
         p = sub.add_parser(name, help=help_text, description=desc)
